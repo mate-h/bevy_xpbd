@@ -64,7 +64,7 @@ fn predict_particle(
     (pos, v)
 }
 
-/// O(n²) self-collision pass matching `collide_pairs` + `collide_apply` in `cloth_sim.wgsl`
+/// O(n²) self-collision pass matching the GPU narrow phase in **`collide_grid_cells`** + **`collide_apply`** (`cloth_sim.wgsl`).
 /// (upper triangle pairs, rest-aware folding test, mass-weighted split, per-axis displacement clamp).
 pub fn self_collision_resolve(
     sim_pos: &mut [Vec3],

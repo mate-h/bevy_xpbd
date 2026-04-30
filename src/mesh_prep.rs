@@ -2,9 +2,90 @@
 //!
 //! Neighbor slices stay cursor-scattered by particle (`neighbor_offsets`): each entry aligns with XPBD λ row indices after **batch‑sorted** constraint order (Gauss–Seidel coloring).
 
-use bevy::math::{Vec2, Vec3};
+use bevy::math::{Vec2, Vec3, Vec4};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+
+/// Clamp so uniform-grid self-collision build stays bounded (GPU radix histogram uses 256 buckets per digit).
+pub const COLLISION_GRID_MAX_CELLS: u32 = 32_768;
+/// Maximum grid resolution along one axis (`derive_collision_grid` grows cell size to stay under [`COLLISION_GRID_MAX_CELLS`]).
+pub const COLLISION_GRID_MAX_AXIS: u32 = 96;
+
+/// BBox (`origin` = min corner) and cell quantization for **`collide_grid_cells`** (`cloth_sim.wgsl`).
+/// Returns `(origin, inv_cell_size, dims[gxyz], num_cells, radix_digits)` for sorting keys in `[0, num_cells)`.
+pub fn derive_collision_grid(rest_positions: &[Vec4], thickness: f32) -> (Vec3, f32, [u32; 3], u32, u32) {
+    if rest_positions.is_empty() {
+        return (
+            Vec3::ZERO,
+            1.0,
+            [1, 1, 1],
+            1,
+            1,
+        );
+    }
+
+    let mut mn = Vec3::splat(f32::MAX);
+    let mut mx = Vec3::splat(f32::MIN);
+    for p in rest_positions {
+        let v = Vec3::new(p.x, p.y, p.z);
+        mn = mn.min(v);
+        mx = mx.max(v);
+    }
+
+    let margin = thickness.mul_add(6.0, thickness * 0.5); // padded rest AABB so motion stays mostly inside grid
+    mn -= Vec3::splat(margin);
+    mx += Vec3::splat(margin);
+
+    let extent = (mx - mn).max(Vec3::splat(1e-4));
+    let n = rest_positions.len() as f32;
+    // More target cells ⇒ smaller buckets ⇒ lighter **`collide_grid_cells`** scans (trade: radix bandwidth).
+    let target_cells_f = (n.sqrt() * 6.25).clamp(256.0, COLLISION_GRID_MAX_CELLS as f32);
+
+    let vol = (extent.x * extent.y * extent.z).max(1e-9);
+    let crude_side = (vol / target_cells_f).powf(1.0 / 3.0);
+    let mut cell_side = crude_side.max(thickness * 2.5).max(1e-5);
+
+    let mut gx: u32;
+    let mut gy: u32;
+    let mut gz: u32;
+
+    loop {
+        gx = ((extent.x / cell_side).ceil() as u32).clamp(1, COLLISION_GRID_MAX_AXIS);
+        gy = ((extent.y / cell_side).ceil() as u32).clamp(1, COLLISION_GRID_MAX_AXIS);
+        gz = ((extent.z / cell_side).ceil() as u32).clamp(1, COLLISION_GRID_MAX_AXIS);
+        let total_cells = gx.saturating_mul(gy).saturating_mul(gz);
+        if total_cells <= COLLISION_GRID_MAX_CELLS && total_cells >= 1 {
+            break;
+        }
+        cell_side *= 1.25;
+        if cell_side > extent.x.max(extent.y).max(extent.z) * 2.5 {
+            // Degenerate bbox; single bucket.
+            gx = 1;
+            gy = 1;
+            gz = 1;
+            cell_side = extent.x.max(extent.y).max(extent.z).max(thickness * 2.5);
+            break;
+        }
+    }
+
+    let inv_cell = 1.0 / cell_side;
+    let radix_digits = {
+        let m = gx.saturating_mul(gy).saturating_mul(gz).saturating_sub(1);
+        if m == 0 {
+            1
+        } else {
+            ((u32::BITS - m.leading_zeros() + 7) / 8).max(1).min(4)
+        }
+    };
+
+    (
+        mn,
+        inv_cell,
+        [gx, gy, gz],
+        gx.saturating_mul(gy).saturating_mul(gz),
+        radix_digits,
+    )
+}
 
 /// Bending constraints (hinge “opposite vertices”): lower α = **stiffer** bend, less edge furling / curl on free boundaries.
 /// Too soft → bottom hem bows inward (curved rest shape) as hinge chains relax under gravity.

@@ -11,7 +11,7 @@
 //! **Dispatch counts:** with **`solve_substeps = S`**, **`solve_inner_iterations = I`**, mesh batch count `B`,
 //! **`predict_copy_sim_to_jac`** merges integrate + jac copy (**6** tail dispatches/substep vs 7 historically):
 //! base **`S * (6 + I * (B + 1)) + 3`** per frame (`ClothSimNode`).
-//! Omit **`clear_atomics` + `collide_pairs` + `collide_apply`** when **`coll_scale ≤ 0`** or when substep **`si`**
+//! Omit **`clear_atomics`** + radix + **`collide_grid_cells`** + **`collide_apply`** when **`coll_scale ≤ 0`** or when substep **`si`**
 //! misses **`collision_every_n_substeps - 1 mod N`** (**`collision_every_n_substeps = 1`** = unchanged).
 //!
 //! **Stability:** Tune [`SUBSTEPS`] / [`INNER_ITERS`] defaults (`to_sim_config`) or **`ClothSimConfig::solve_*`** overrides; stretch α = 0 with few iterations often looks like edge-length “explosion”.
@@ -57,7 +57,7 @@ pub const SUBSTEPS: u32 = 36;
 pub const INNER_ITERS: u32 = 22;
 pub const DT: f32 = 1.0 / 60.0;
 pub const THICKNESS: f32 = 0.04;
-/// Scales overlap correction in `collide_pairs` / `collide_apply`; `0` disables self-collision.
+/// Scales overlap correction in **`collide_grid_cells`** / `collide_apply`; `0` disables self-collision.
 pub const DEFAULT_COLL_SCALE: f32 = 0.38;
 /// Linear air-drag coefficient \(k\) [1/s]: each substep applies `v *= exp(-k · Δt_sub)` in `post_velocity`
 /// (matches `dv/dt ≈ -k v` for light viscous / laminar-like damping). **`0`** disables explicit drag.
@@ -69,7 +69,7 @@ pub const DEFAULT_LINEAR_AIR_DRAG_PER_SEC: f32 = 1.25;
 pub const JACOBI_CORRECTION_CAP: f32 = 0.28;
 /// Hard speed clamp after gravity in `predict` (m/s).
 pub const PREDICT_MAX_SPEED: f32 = 12.0;
-/// Integer scale for GPU `atomicAdd` in `collide_pairs` (`cloth_sim.wgsl`); CPU sums `f32` directly.
+/// Integer scale for GPU `atomicAdd` in self-collision narrow phase (`cloth_sim.wgsl`); CPU sums `f32` directly.
 pub const COLLISION_PAIR_FIXSCALE: i32 = 10_000;
 /// Clamp on accumulated self-collision displacement per particle per substep (`collide_apply`).
 pub const COLLISION_APPLY_CLAMP: f32 = 0.35;
@@ -108,12 +108,19 @@ pub struct ClothSimConfig {
     pub solve_substeps: u32,
     /// Gauss–Seidel / distance iterations per substep (clears λ, then **`B`** `gs_edges` batches).
     pub solve_inner_iterations: u32,
-    /// With **`N = collision_every_n_substeps.max(1)`**, run **`clear_atomics` → `collide_pairs` → `collide_apply`**
+    /// With **`N = collision_every_n_substeps.max(1)`**, run **`clear_atomics` → (radix sort + `collide_grid_cells`) → `collide_apply`**
     /// only when **`si % N == N - 1`** ( **`N = 1`** = every substep). Skipped entirely when **`coll_scale ≤ 0`** on the extracted uniform.
     pub collision_every_n_substeps: u32,
     pub num_particles: u32,
     pub num_tris: u32,
     pub num_distance_constraints: u32,
+    /// Spatial hash bounds for **`collide_grid_cells`**: **[`mesh_prep::derive_collision_grid`]** at load time (**`rest_pos`** + thickness).
+    pub coll_grid_origin: Vec3,
+    pub coll_grid_inv_cell: f32,
+    pub coll_grid_dims: [u32; 3],
+    pub coll_num_cells: u32,
+    /// Digit passes for radix sort by flat cell (`ceil(bits(flat_max))/8`).
+    pub coll_radix_digits: u32,
     pub constraint_batch_offsets: Vec<u32>,
     pub constraint_batch_count: u32,
     pub constraint_i: Vec<u32>,
@@ -206,6 +213,49 @@ pub struct ClothSimParamsGpu {
     pub _uniform_encase_reserve: [u32; 2],
 }
 
+/// **`coll_grid_u`** uniform (`cloth_sim.wgsl`) — spatial hash bookkeeping for **`collide_grid_cells`**.
+///
+/// WGSL aligns the trailing **`vec4<u32>`_reserved** — keep **`_align_pad`** + **`_reserved`** in sync with `cloth_sim.wgsl`.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ClothCollGridGpu {
+    pub grid_origin_pad: [f32; 4],
+    pub inv_cell: f32,
+    pub num_cells: u32,
+    pub num_particles: u32,
+    pub gx: u32,
+    pub gy: u32,
+    pub gz: u32,
+    pub radix_digits: u32,
+    pub _align_pad: [u8; 4],
+    pub _reserved: [u32; 4],
+}
+
+impl ClothCollGridGpu {
+    pub fn pack_from_config(cfg: &ClothSimConfig) -> Self {
+        let o = cfg.coll_grid_origin;
+        Self {
+            grid_origin_pad: [o.x, o.y, o.z, 0.0],
+            inv_cell: cfg.coll_grid_inv_cell,
+            num_cells: cfg.coll_num_cells,
+            num_particles: cfg.num_particles,
+            gx: cfg.coll_grid_dims[0],
+            gy: cfg.coll_grid_dims[1],
+            gz: cfg.coll_grid_dims[2],
+            radix_digits: cfg.coll_radix_digits,
+            _align_pad: [0u8; 4],
+            _reserved: [0u32; 4],
+        }
+    }
+}
+
+/// WGSL **`CollRadixPassUniform`**: radix pass index lives in **`data.x`** (`vec4<u32>` for uniform alignment).
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ClothCollRadixPassGpu {
+    pub data: [u32; 4],
+}
+
 impl ClothSimParamsGpu {
     /// Fills GPU uniform bytes; **`constraint_batch_count`** must match **`constraint_batch_offsets`** (length − 1).
     pub fn pack(uniforms: &ClothSimUniforms, constraint_batch_count: u32) -> Self {
@@ -259,6 +309,14 @@ pub struct ClothSimBuffers {
     pub atomic_norm: Buffer,
     /// `binding(19)` lut: **`batch_count`** slots × [`GS_BATCH_DYNAMIC_STRIDE`] bytes (batch indices 0…).
     pub gs_batch_dyn: Buffer,
+    pub coll_grid_uniform: Buffer,
+    pub coll_radix_pass_uniform: Buffer,
+    pub coll_radix_hist: Buffer,
+    pub coll_radix_head: Buffer,
+    pub coll_perm_ping: Buffer,
+    pub coll_perm_pong: Buffer,
+    pub coll_cell_start: Buffer,
+    pub coll_cell_end_exclusive: Buffer,
 }
 
 #[derive(Resource)]
@@ -270,7 +328,14 @@ struct ClothPipeline {
     gs_edges: CachedComputePipelineId,
     post_velocity: CachedComputePipelineId,
     clear_atomics: CachedComputePipelineId,
-    collide_pairs: CachedComputePipelineId,
+    coll_cell_bounds_clear: CachedComputePipelineId,
+    coll_perm_identity_ping: CachedComputePipelineId,
+    coll_histogram_clear: CachedComputePipelineId,
+    coll_radix_digit_count: CachedComputePipelineId,
+    coll_radix_exclusive_bases_heads: CachedComputePipelineId,
+    coll_radix_digit_scatter: CachedComputePipelineId,
+    coll_sorted_build_cell_ranges: CachedComputePipelineId,
+    collide_grid_cells: CachedComputePipelineId,
     collide_apply: CachedComputePipelineId,
     clear_norm_atomics: CachedComputePipelineId,
     accumulate_normals: CachedComputePipelineId,
@@ -498,6 +563,72 @@ fn init_cloth_sim(
     });
     render_queue.write_buffer(&gs_batch_dyn, 0, &gs_dyn_lut);
 
+    let coll_grid_u_sz = std::mem::size_of::<ClothCollGridGpu>() as u64;
+    let coll_radix_pass_sz = std::mem::size_of::<ClothCollRadixPassGpu>() as u64;
+    let radix_arr = 256u64 * 4;
+    let radix_nz = NonZero::new(radix_arr).expect("radix atomic buffer size");
+    let nc = config.coll_num_cells.max(1) as usize;
+    let perm_nz = NonZero::new(u32_sz(n)).expect("perm buffer");
+    let cell_nz = NonZero::new(u32_sz(nc)).expect("cell buffer");
+
+    let coll_grid_uniform = render_device.create_buffer(&BufferDescriptor {
+        label: Some("cloth_coll_grid_uniform"),
+        size: coll_grid_u_sz,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let grid_gpu = ClothCollGridGpu::pack_from_config(&*config);
+    render_queue.write_buffer(&coll_grid_uniform, 0, bytemuck::bytes_of(&grid_gpu));
+
+    let coll_radix_pass_uniform = render_device.create_buffer(&BufferDescriptor {
+        label: Some("cloth_coll_radix_pass_uniform"),
+        size: coll_radix_pass_sz,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    render_queue.write_buffer(
+        &coll_radix_pass_uniform,
+        0,
+        bytemuck::bytes_of(&ClothCollRadixPassGpu { data: [0u32; 4] }),
+    );
+
+    let coll_radix_hist = render_device.create_buffer(&BufferDescriptor {
+        label: Some("cloth_coll_radix_hist"),
+        size: radix_arr,
+        usage,
+        mapped_at_creation: false,
+    });
+    let coll_radix_head = render_device.create_buffer(&BufferDescriptor {
+        label: Some("cloth_coll_radix_head"),
+        size: radix_arr,
+        usage,
+        mapped_at_creation: false,
+    });
+    let coll_perm_ping = render_device.create_buffer(&BufferDescriptor {
+        label: Some("cloth_coll_perm_ping"),
+        size: u32_sz(n),
+        usage,
+        mapped_at_creation: false,
+    });
+    let coll_perm_pong = render_device.create_buffer(&BufferDescriptor {
+        label: Some("cloth_coll_perm_pong"),
+        size: u32_sz(n),
+        usage,
+        mapped_at_creation: false,
+    });
+    let coll_cell_start = render_device.create_buffer(&BufferDescriptor {
+        label: Some("cloth_coll_cell_start"),
+        size: u32_sz(nc),
+        usage,
+        mapped_at_creation: false,
+    });
+    let coll_cell_end_exclusive = render_device.create_buffer(&BufferDescriptor {
+        label: Some("cloth_coll_cell_end_exclusive"),
+        size: u32_sz(nc),
+        usage,
+        mapped_at_creation: false,
+    });
+
     if ec > 0 {
         render_queue.write_buffer(
             &constraint_i_buf,
@@ -586,6 +717,20 @@ fn init_cloth_sim(
                 storage_buffer_sized(false, None),
                 storage_buffer_sized(false, None),
                 uniform_buffer_sized(true, NonZero::new(GS_BATCH_DYNAMIC_STRIDE as u64)),
+                uniform_buffer_sized(
+                    false,
+                    NonZero::new(std::mem::size_of::<ClothCollGridGpu>() as u64),
+                ),
+                uniform_buffer_sized(
+                    false,
+                    NonZero::new(std::mem::size_of::<ClothCollRadixPassGpu>() as u64),
+                ),
+                storage_buffer_sized(false, Some(radix_nz)),
+                storage_buffer_sized(false, Some(radix_nz)),
+                storage_buffer_sized(false, Some(perm_nz)),
+                storage_buffer_sized(false, Some(perm_nz)),
+                storage_buffer_sized(false, Some(cell_nz)),
+                storage_buffer_sized(false, Some(cell_nz)),
             ),
         ),
     );
@@ -618,7 +763,32 @@ fn init_cloth_sim(
         gs_edges: cp!("cloth_cs_gs_edges", "gs_edges"),
         post_velocity: cp!("cloth_cs_post_velocity", "post_velocity"),
         clear_atomics: cp!("cloth_cs_clear_atomics", "clear_atomics"),
-        collide_pairs: cp!("cloth_cs_collide_pairs", "collide_pairs"),
+        coll_cell_bounds_clear: cp!(
+            "cloth_cs_coll_cell_bounds_clear",
+            "coll_cell_bounds_clear"
+        ),
+        coll_perm_identity_ping: cp!(
+            "cloth_cs_coll_perm_identity_ping",
+            "coll_perm_identity_ping"
+        ),
+        coll_histogram_clear: cp!("cloth_cs_coll_histogram_clear", "coll_histogram_clear"),
+        coll_radix_digit_count: cp!(
+            "cloth_cs_coll_radix_digit_count",
+            "coll_radix_digit_count"
+        ),
+        coll_radix_exclusive_bases_heads: cp!(
+            "cloth_cs_coll_radix_exclusive_bases_heads",
+            "coll_radix_exclusive_bases_heads"
+        ),
+        coll_radix_digit_scatter: cp!(
+            "cloth_cs_coll_radix_digit_scatter",
+            "coll_radix_digit_scatter"
+        ),
+        coll_sorted_build_cell_ranges: cp!(
+            "cloth_cs_coll_sorted_build_cell_ranges",
+            "coll_sorted_build_cell_ranges"
+        ),
+        collide_grid_cells: cp!("cloth_cs_collide_grid_cells", "collide_grid_cells"),
         collide_apply: cp!("cloth_cs_collide_apply", "collide_apply"),
         clear_norm_atomics: cp!("cloth_cs_clear_norm_atomics", "clear_norm_atomics"),
         accumulate_normals: cp!("cloth_cs_accumulate_normals", "accumulate_normals"),
@@ -644,6 +814,14 @@ fn init_cloth_sim(
         atomic_coll,
         atomic_norm,
         gs_batch_dyn,
+        coll_grid_uniform,
+        coll_radix_pass_uniform,
+        coll_radix_hist,
+        coll_radix_head,
+        coll_perm_ping,
+        coll_perm_pong,
+        coll_cell_start,
+        coll_cell_end_exclusive,
     });
 }
 
@@ -685,6 +863,14 @@ fn make_bind_group(
                 offset: 0,
                 size: Some(gs_dyn_slot),
             },
+            buffers.coll_grid_uniform.as_entire_buffer_binding(),
+            buffers.coll_radix_pass_uniform.as_entire_buffer_binding(),
+            buffers.coll_radix_hist.as_entire_binding(),
+            buffers.coll_radix_head.as_entire_binding(),
+            buffers.coll_perm_ping.as_entire_binding(),
+            buffers.coll_perm_pong.as_entire_binding(),
+            buffers.coll_cell_start.as_entire_binding(),
+            buffers.coll_cell_end_exclusive.as_entire_binding(),
         )),
     )
 }
@@ -728,6 +914,13 @@ fn prepare_cloth_bind_groups(
         bytemuck::bytes_of(&gpu_params),
     );
 
+    let gpu_grid = ClothCollGridGpu::pack_from_config(config);
+    render_queue.write_buffer(
+        &buffers.coll_grid_uniform,
+        0,
+        bytemuck::bytes_of(&gpu_grid),
+    );
+
     let cloth_bg = make_bind_group(
         &render_device,
         &pipeline_cache,
@@ -754,6 +947,7 @@ fn check_cloth_pipeline(
     for id in [
         pipeline.predict_copy_sim_to_jac,
         pipeline.gs_edges,
+        pipeline.collide_grid_cells,
         pipeline.finalize_normals,
     ] {
         match pipeline_cache.get_compute_pipeline_state(id) {
@@ -808,8 +1002,10 @@ impl render_graph::Node for ClothSimNode {
         let wg64 = (n + 63) / 64;
         let wg256 = (n * 3 + 255) / 256;
         let wg_tris = (config.num_tris + 63) / 64;
-        let pairs = n * (n - 1) / 2;
-        let wg_pairs = (pairs + 255) / 256;
+        let wg_n256 = (n + 255) / 256;
+        let num_cells = config.coll_num_cells.max(1);
+        let wg_cell_clear = (num_cells + 255) / 256;
+        let radix_digits = config.coll_radix_digits.max(1);
         let n_constraints = config.num_distance_constraints;
         let wg_constraints = (n_constraints + 63) / 64;
         let num_batches = config.constraint_batch_count as usize;
@@ -820,6 +1016,8 @@ impl render_graph::Node for ClothSimNode {
 
         const DYN_IDLE: &[u32] = &[0];
         let encoder = render_context.command_encoder();
+        let render_queue = world.resource::<RenderQueue>();
+        let collision_buffers = world.resource::<ClothSimBuffers>();
 
         for si in 0..substeps {
             let run_collision_trio =
@@ -895,20 +1093,98 @@ impl render_graph::Node for ClothSimNode {
                     pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
                     pass.set_pipeline(
                         pipeline_cache
-                            .get_compute_pipeline(pipeline.collide_pairs)
+                            .get_compute_pipeline(pipeline.coll_perm_identity_ping)
                             .unwrap(),
                     );
-                    pass.dispatch_workgroups(wg_pairs, 1, 1);
+                    pass.dispatch_workgroups(wg_n256.max(1), 1, 1);
+                }
+            }
 
-                    pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
-                    pass.set_pipeline(
+            if run_collision_trio {
+                let cb = collision_buffers;
+                for d in 0..radix_digits {
+                    let radix_u = ClothCollRadixPassGpu {
+                        data: [d, 0, 0, 0],
+                    };
+                    render_queue.write_buffer(
+                        &cb.coll_radix_pass_uniform,
+                        0,
+                        bytemuck::bytes_of(&radix_u),
+                    );
+
+                    let mut rpass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                        label: Some("cloth_pass_collision_radix"),
+                        timestamp_writes: None,
+                    });
+                    rpass.set_bind_group(0, &bg.cloth, DYN_IDLE);
+                    rpass.set_pipeline(
                         pipeline_cache
-                            .get_compute_pipeline(pipeline.collide_apply)
+                            .get_compute_pipeline(pipeline.coll_histogram_clear)
                             .unwrap(),
                     );
-                    pass.dispatch_workgroups(wg64, 1, 1);
+                    rpass.dispatch_workgroups(1, 1, 1);
+
+                    rpass.set_pipeline(
+                        pipeline_cache
+                            .get_compute_pipeline(pipeline.coll_radix_digit_count)
+                            .unwrap(),
+                    );
+                    rpass.dispatch_workgroups(wg_n256.max(1), 1, 1);
+
+                    rpass.set_pipeline(
+                        pipeline_cache
+                            .get_compute_pipeline(pipeline.coll_radix_exclusive_bases_heads)
+                            .unwrap(),
+                    );
+                    rpass.dispatch_workgroups(1, 1, 1);
+
+                    rpass.set_pipeline(
+                        pipeline_cache
+                            .get_compute_pipeline(pipeline.coll_radix_digit_scatter)
+                            .unwrap(),
+                    );
+                    rpass.dispatch_workgroups(wg_n256.max(1), 1, 1);
                 }
 
+                let mut cpass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("cloth_pass_collision_grid_narrow"),
+                    timestamp_writes: None,
+                });
+                cpass.set_bind_group(0, &bg.cloth, DYN_IDLE);
+                cpass.set_pipeline(
+                    pipeline_cache
+                        .get_compute_pipeline(pipeline.coll_cell_bounds_clear)
+                        .unwrap(),
+                );
+                cpass.dispatch_workgroups(wg_cell_clear.max(1), 1, 1);
+
+                cpass.set_pipeline(
+                    pipeline_cache
+                        .get_compute_pipeline(pipeline.coll_sorted_build_cell_ranges)
+                        .unwrap(),
+                );
+                cpass.dispatch_workgroups(wg_n256.max(1), 1, 1);
+
+                cpass.set_pipeline(
+                    pipeline_cache
+                        .get_compute_pipeline(pipeline.collide_grid_cells)
+                        .unwrap(),
+                );
+                        cpass.dispatch_workgroups(wg_n256.max(1), 1, 1);
+
+                cpass.set_pipeline(
+                    pipeline_cache
+                        .get_compute_pipeline(pipeline.collide_apply)
+                        .unwrap(),
+                );
+                cpass.dispatch_workgroups(wg64, 1, 1);
+            }
+
+            {
+                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("cloth_pass_post_velocity"),
+                    timestamp_writes: None,
+                });
                 pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
                 pass.set_pipeline(
                     pipeline_cache
@@ -1045,6 +1321,14 @@ impl ClothMeshData {
             .map(|p| Vec4::new(p.x, p.y, p.z, 0.0))
             .collect();
 
+        let (
+            coll_grid_origin,
+            coll_grid_inv_cell,
+            coll_grid_dims,
+            coll_num_cells,
+            coll_radix_digits,
+        ) = crate::mesh_prep::derive_collision_grid(&rest_pos, THICKNESS);
+
         let initial_nrm: Vec<Vec4> = self
             .normals
             .iter()
@@ -1068,6 +1352,11 @@ impl ClothMeshData {
             solve_substeps: SUBSTEPS,
             solve_inner_iterations: INNER_ITERS,
             collision_every_n_substeps: 1,
+            coll_grid_origin,
+            coll_grid_inv_cell,
+            coll_grid_dims,
+            coll_num_cells,
+            coll_radix_digits,
             render_positions: buf_assets.add(rp),
             render_normals: buf_assets.add(rn),
             num_particles: self.num_particles,

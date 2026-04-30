@@ -7,8 +7,8 @@ use std::path::Path;
 use bevy::math::{Vec3, Vec4};
 
 use crate::cloth_compute::{
-    ClothSimParamsGpu, ClothSimUniforms, DT, GS_BATCH_DYNAMIC_STRIDE, GS_EDGE_THREADS, INNER_ITERS,
-    SUBSTEPS,
+    ClothCollGridGpu, ClothCollRadixPassGpu, ClothSimParamsGpu, ClothSimUniforms, DT,
+    GS_BATCH_DYNAMIC_STRIDE, GS_EDGE_THREADS, INNER_ITERS, SUBSTEPS, THICKNESS,
 };
 use crate::mesh_prep::ClothMeshData;
 use crate::xpbd_cpu::{xpbd_substep_with_self_collision, XpbdCpuTimeStepParams};
@@ -26,7 +26,14 @@ struct WgpuClothContext {
     gs_edges: wgpu::ComputePipeline,
     post_velocity: wgpu::ComputePipeline,
     clear_atomics: wgpu::ComputePipeline,
-    collide_pairs: wgpu::ComputePipeline,
+    coll_cell_bounds_clear: wgpu::ComputePipeline,
+    coll_perm_identity_ping: wgpu::ComputePipeline,
+    coll_histogram_clear: wgpu::ComputePipeline,
+    coll_radix_digit_count: wgpu::ComputePipeline,
+    coll_radix_exclusive_bases_heads: wgpu::ComputePipeline,
+    coll_radix_digit_scatter: wgpu::ComputePipeline,
+    coll_sorted_build_cell_ranges: wgpu::ComputePipeline,
+    collide_grid_cells: wgpu::ComputePipeline,
     collide_apply: wgpu::ComputePipeline,
     bind_layout: wgpu::BindGroupLayout,
 }
@@ -99,6 +106,20 @@ impl WgpuClothContext {
                     },
                     count: None,
                 },
+                uniform_fixed_entry(
+                    20,
+                    std::mem::size_of::<ClothCollGridGpu>() as u64,
+                ),
+                uniform_fixed_entry(
+                    21,
+                    std::mem::size_of::<ClothCollRadixPassGpu>() as u64,
+                ),
+                storage_sized_entry(22, false, 256 * 4),
+                storage_sized_entry(23, false, 256 * 4),
+                storage_entry(24, false),
+                storage_entry(25, false),
+                storage_entry(26, false),
+                storage_entry(27, false),
             ],
         });
 
@@ -128,7 +149,14 @@ impl WgpuClothContext {
             gs_edges: cp!("gs_edges"),
             post_velocity: cp!("post_velocity"),
             clear_atomics: cp!("clear_atomics"),
-            collide_pairs: cp!("collide_pairs"),
+            coll_cell_bounds_clear: cp!("coll_cell_bounds_clear"),
+            coll_perm_identity_ping: cp!("coll_perm_identity_ping"),
+            coll_histogram_clear: cp!("coll_histogram_clear"),
+            coll_radix_digit_count: cp!("coll_radix_digit_count"),
+            coll_radix_exclusive_bases_heads: cp!("coll_radix_exclusive_bases_heads"),
+            coll_radix_digit_scatter: cp!("coll_radix_digit_scatter"),
+            coll_sorted_build_cell_ranges: cp!("coll_sorted_build_cell_ranges"),
+            collide_grid_cells: cp!("collide_grid_cells"),
             collide_apply: cp!("collide_apply"),
             device,
             queue,
@@ -145,6 +173,32 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
             ty: wgpu::BufferBindingType::Storage { read_only },
             has_dynamic_offset: false,
             min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn uniform_fixed_entry(binding: u32, size: u64) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: NonZeroU64::new(size),
+        },
+        count: None,
+    }
+}
+
+fn storage_sized_entry(binding: u32, read_only: bool, bytes: u64) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: NonZeroU64::new(bytes),
         },
         count: None,
     }
@@ -171,6 +225,16 @@ struct Buffers {
     atomic_coll: wgpu::Buffer,
     atomic_norm: wgpu::Buffer,
     gs_batch_dyn: wgpu::Buffer,
+    coll_grid_uniform: wgpu::Buffer,
+    coll_radix_pass_uniform: wgpu::Buffer,
+    coll_radix_hist: wgpu::Buffer,
+    coll_radix_head: wgpu::Buffer,
+    coll_perm_ping: wgpu::Buffer,
+    coll_perm_pong: wgpu::Buffer,
+    coll_cell_start: wgpu::Buffer,
+    coll_cell_end_exclusive: wgpu::Buffer,
+    coll_num_cells: u32,
+    coll_radix_digits: u32,
 }
 
 fn make_buffers(ctx: &WgpuClothContext, mesh: &ClothMeshData) -> Buffers {
@@ -360,6 +424,67 @@ fn make_buffers(ctx: &WgpuClothContext, mesh: &ClothMeshData) -> Buffers {
     });
     ctx.queue.write_buffer(&gs_batch_dyn, 0, &gs_dyn_lut);
 
+    let (
+        grid_origin,
+        coll_inv_cell,
+        coll_dims,
+        coll_nc,
+        coll_rd,
+    ) = crate::mesh_prep::derive_collision_grid(&rest_pos, THICKNESS);
+    let coll_num_cells_meta = coll_nc.max(1);
+    let coll_radix_digits_meta = coll_rd.max(1);
+    let nc_usize = coll_num_cells_meta as usize;
+
+    let coll_grid_uniform = dev.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cloth_coll_grid_uniform"),
+        size: std::mem::size_of::<ClothCollGridGpu>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let gpu_grid = ClothCollGridGpu {
+        grid_origin_pad: [grid_origin.x, grid_origin.y, grid_origin.z, 0.0],
+        inv_cell: coll_inv_cell,
+        num_cells: coll_num_cells_meta,
+        num_particles: mesh.num_particles,
+        gx: coll_dims[0],
+        gy: coll_dims[1],
+        gz: coll_dims[2],
+        radix_digits: coll_radix_digits_meta,
+        _align_pad: [0u8; 4],
+        _reserved: [0u32; 4],
+    };
+    ctx.queue.write_buffer(
+        &coll_grid_uniform,
+        0,
+        bytemuck::bytes_of(&gpu_grid),
+    );
+
+    let coll_radix_pass_uniform = dev.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cloth_coll_radix_pass_uniform"),
+        size: std::mem::size_of::<ClothCollRadixPassGpu>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    ctx.queue.write_buffer(
+        &coll_radix_pass_uniform,
+        0,
+        bytemuck::bytes_of(&ClothCollRadixPassGpu { data: [0u32; 4] }),
+    );
+
+    let radix_sz = (256 * 4) as u64;
+    let coll_radix_hist = vb("cloth_coll_radix_hist", radix_sz);
+    let coll_radix_head = vb("cloth_coll_radix_head", radix_sz);
+    let coll_perm_ping = vb("cloth_coll_perm_ping", (n * 4) as u64);
+    let coll_perm_pong = vb("cloth_coll_perm_pong", (n * 4) as u64);
+    let coll_cell_start = vb(
+        "cloth_coll_cell_start",
+        (std::mem::size_of::<u32>() as u64).saturating_mul(nc_usize as u64),
+    );
+    let coll_cell_end_exclusive = vb(
+        "cloth_coll_cell_end_exclusive",
+        (std::mem::size_of::<u32>() as u64).saturating_mul(nc_usize as u64),
+    );
+
     let params = dev.create_buffer(&wgpu::BufferDescriptor {
         label: Some("cloth_sim_params_uniform"),
         size: std::mem::size_of::<ClothSimParamsGpu>() as u64,
@@ -388,6 +513,16 @@ fn make_buffers(ctx: &WgpuClothContext, mesh: &ClothMeshData) -> Buffers {
         atomic_coll,
         atomic_norm,
         gs_batch_dyn,
+        coll_grid_uniform,
+        coll_radix_pass_uniform,
+        coll_radix_hist,
+        coll_radix_head,
+        coll_perm_ping,
+        coll_perm_pong,
+        coll_cell_start,
+        coll_cell_end_exclusive,
+        coll_num_cells: coll_num_cells_meta,
+        coll_radix_digits: coll_radix_digits_meta,
     }
 }
 
@@ -480,13 +615,45 @@ fn make_bind_group(ctx: &WgpuClothContext, b: &Buffers) -> wgpu::BindGroup {
                     size: wgpu::BufferSize::new(GS_BATCH_DYNAMIC_STRIDE.into()),
                 }),
             },
+            wgpu::BindGroupEntry {
+                binding: 20,
+                resource: b.coll_grid_uniform.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 21,
+                resource: b.coll_radix_pass_uniform.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 22,
+                resource: b.coll_radix_hist.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 23,
+                resource: b.coll_radix_head.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 24,
+                resource: b.coll_perm_ping.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 25,
+                resource: b.coll_perm_pong.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 26,
+                resource: b.coll_cell_start.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 27,
+                resource: b.coll_cell_end_exclusive.as_entire_binding(),
+            },
         ],
     })
 }
 
 fn run_one_gpu_substep(
     ctx: &WgpuClothContext,
-    _b: &Buffers,
+    b: &Buffers,
     bg: &wgpu::BindGroup,
     mesh: &ClothMeshData,
     n: u32,
@@ -494,16 +661,18 @@ fn run_one_gpu_substep(
 ) {
     let wg64 = ((n as usize) + 63) / 64;
     let wg256 = (n as usize * 3 + 255) / 256;
-    let pairs = n as usize * ((n as usize).saturating_sub(1)) / 2;
-    let wg_pairs = (pairs + 255) / 256;
+    let wg_n256_parity = (((n as usize) + 255) / 256).max(1);
+    let num_cells_b = b.coll_num_cells.max(1);
+    let wg_cell_clear = ((num_cells_b as usize) + 255) / 256;
+    let radix_digits = b.coll_radix_digits.max(1);
     let wg_constraints = (num_constraints as usize + 63) / 64;
     let num_batches = mesh.constraint_batch_count as usize;
 
-        let mut encoder = ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("cloth_encoder_substep"),
-            });
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("cloth_encoder_substep"),
+        });
     const DYN_IDLE: &[u32] = &[0];
 
     {
@@ -545,7 +714,7 @@ fn run_one_gpu_substep(
 
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("cloth_pass_collision_velocity"),
+            label: Some("cloth_pass_collision_velocity_seed"),
             timestamp_writes: None,
         });
         pass.set_pipeline(&ctx.copy_jac_to_sim);
@@ -556,14 +725,63 @@ fn run_one_gpu_substep(
         pass.set_bind_group(0, bg, DYN_IDLE);
         pass.dispatch_workgroups(wg256 as u32, 1, 1);
 
-        pass.set_pipeline(&ctx.collide_pairs);
+        pass.set_pipeline(&ctx.coll_perm_identity_ping);
         pass.set_bind_group(0, bg, DYN_IDLE);
-        pass.dispatch_workgroups(wg_pairs as u32, 1, 1);
+        pass.dispatch_workgroups(wg_n256_parity as u32, 1, 1);
+    }
 
-        pass.set_pipeline(&ctx.collide_apply);
-        pass.set_bind_group(0, bg, DYN_IDLE);
-        pass.dispatch_workgroups(wg64 as u32, 1, 1);
+    for d in 0..radix_digits {
+        let radix_u = ClothCollRadixPassGpu {
+            data: [d, 0, 0, 0],
+        };
+        ctx.queue.write_buffer(
+            &b.coll_radix_pass_uniform,
+            0,
+            bytemuck::bytes_of(&radix_u),
+        );
 
+        let mut rpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("cloth_pass_collision_radix"),
+            timestamp_writes: None,
+        });
+        rpass.set_bind_group(0, bg, DYN_IDLE);
+        rpass.set_pipeline(&ctx.coll_histogram_clear);
+        rpass.dispatch_workgroups(1, 1, 1);
+
+        rpass.set_pipeline(&ctx.coll_radix_digit_count);
+        rpass.dispatch_workgroups(wg_n256_parity as u32, 1, 1);
+
+        rpass.set_pipeline(&ctx.coll_radix_exclusive_bases_heads);
+        rpass.dispatch_workgroups(1, 1, 1);
+
+        rpass.set_pipeline(&ctx.coll_radix_digit_scatter);
+        rpass.dispatch_workgroups(wg_n256_parity as u32, 1, 1);
+    }
+
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("cloth_pass_collision_grid_narrow"),
+            timestamp_writes: None,
+        });
+        cpass.set_bind_group(0, bg, DYN_IDLE);
+        cpass.set_pipeline(&ctx.coll_cell_bounds_clear);
+        cpass.dispatch_workgroups(wg_cell_clear.max(1) as u32, 1, 1);
+
+        cpass.set_pipeline(&ctx.coll_sorted_build_cell_ranges);
+        cpass.dispatch_workgroups(wg_n256_parity as u32, 1, 1);
+
+        cpass.set_pipeline(&ctx.collide_grid_cells);
+        cpass.dispatch_workgroups(wg_n256_parity as u32, 1, 1);
+
+        cpass.set_pipeline(&ctx.collide_apply);
+        cpass.dispatch_workgroups(wg64 as u32, 1, 1);
+    }
+
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("cloth_pass_post_velocity"),
+            timestamp_writes: None,
+        });
         pass.set_pipeline(&ctx.post_velocity);
         pass.set_bind_group(0, bg, DYN_IDLE);
         pass.dispatch_workgroups(wg64 as u32, 1, 1);
