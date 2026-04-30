@@ -1,0 +1,23 @@
+[package]
+name = "bevy_xpbd"
+version = "0.1.0"
+edition = "2021"
+description = "GPU XPBD cloth with Bevy 0.18 (wgpu/WebGPU)"
+
+[lib]
+path = "src/lib.rs"
+
+[[example]]
+name = "cloth_xpbd"
+path = "examples/cloth_xpbd.rs"
+
+[dependencies]
+bevy = "0.18.1"
+bytemuck = { version = "1.22", features = ["derive"] }
+
+[dev-dependencies]
+pollster = "0.4"
+wgpu = "27.0.1"
+
+[profile.dev]
+opt-level = 1
