@@ -16,8 +16,8 @@ use bevy_xpbd::{
 };
 
 /// Quad resolution (was 24×18 at 0.045 m cells ≈ 1.08 × 0.81 m sheet). Aspect matches 24:18.
-const CLOTH_QUAD_COLS: u32 = 128/2;
-const CLOTH_QUAD_ROWS: u32 = 96/2;
+const CLOTH_QUAD_COLS: u32 = 128;
+const CLOTH_QUAD_ROWS: u32 = 96;
 /// Matches prior world size: `(24 × 0.045) / 128` — tweak `CLOTH_QUAD_*` freely with this formula.
 const CLOTH_CELL_SIZE: f32 = (24.0 * 0.045 * 2.0) / CLOTH_QUAD_COLS as f32;
 
@@ -75,10 +75,10 @@ fn setup(
 
     commands.insert_resource(ClothSimConfig {
         // Higher particle count (~12k vs ~475) benefits from somewhat more solver work than the prior demo tuning.
-        solve_substeps: 32,
-        solve_inner_iterations: 18,
+        solve_substeps: 24,
+        solve_inner_iterations: 8,
         // Halves pairwise self-collision work when `coll_scale > 0` (runs on odd-indexed substeps).
-        collision_every_n_substeps: 2,
+        collision_every_n_substeps: 4,
         render_positions: config.render_positions.clone(),
         render_normals: config.render_normals.clone(),
         ..config

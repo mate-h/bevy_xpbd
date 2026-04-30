@@ -55,7 +55,16 @@ pub const CLOTH_SHADER: &str = "shaders/cloth_sim.wgsl";
 pub const SUBSTEPS: u32 = 36;
 /// Inner XPBD constraint iterations per substep (GS + coloring).
 pub const INNER_ITERS: u32 = 22;
-pub const DT: f32 = 1.0 / 60.0;
+/// Assumed **wall-clock** frame duration for CPU tests, GPU–CPU parity, and [`ClothSimUniforms::default`].
+/// At runtime, [`sync_cloth_solve_budget_to_uniforms`] drives `dt` from [`Time::delta_secs`] after **clamp +
+/// exponential smoothing** ([`ClothSimFrameTiming`]) so α̃ = α/Δt² doesn’t jitter every VSYNC gap.
+pub const REFERENCE_FRAME_DELTA_SECS: f32 = 1.0 / 60.0;
+/// Values below this are treated as zero-delta for physics (avoids `inv_dt` blow-up on the first frame / timer bugs).
+pub const MIN_FRAME_DELTA_SECS: f32 = 1e-6;
+/// Default ceiling on **wall-clock** frame Δ before smoothing (stabler XPBD after hitches / tab-switch).
+pub const DEFAULT_MAX_FRAME_DELTA_SECS: f32 = REFERENCE_FRAME_DELTA_SECS * 2.75;
+/// Blend each frame toward raw clamped Δ: `smooth := smooth * (1 - α) + raw * α`.
+pub const DEFAULT_FRAME_DELTA_BLEND_ALPHA: f32 = 0.18;
 pub const THICKNESS: f32 = 0.04;
 /// Scales overlap correction in **`collide_grid_cells`** / `collide_apply`; `0` disables self-collision.
 pub const DEFAULT_COLL_SCALE: f32 = 0.38;
@@ -99,10 +108,30 @@ impl Default for ClothSimControl {
     }
 }
 
+/// Low-pass **wall-clock** Δt used for [`ClothSimUniforms::dt`] scaling (reduces XPBD “wobble” from frame-time jitter).
+///
+/// Set **`blend_alpha`** to **`1.0`** to disable smoothing (raw clamped [`Time::delta_secs`] only).
+#[derive(Resource)]
+pub struct ClothSimFrameTiming {
+    pub smoothed_wall_delta_secs: f32,
+    pub blend_alpha: f32,
+    pub max_wall_delta_secs: f32,
+}
+
+impl Default for ClothSimFrameTiming {
+    fn default() -> Self {
+        Self {
+            smoothed_wall_delta_secs: REFERENCE_FRAME_DELTA_SECS,
+            blend_alpha: DEFAULT_FRAME_DELTA_BLEND_ALPHA,
+            max_wall_delta_secs: DEFAULT_MAX_FRAME_DELTA_SECS,
+        }
+    }
+}
+
 /// CPU-side config extracted to the render world.
 #[derive(Resource, Clone, ExtractResource, Reflect)]
 pub struct ClothSimConfig {
-    /// XPBD substeps per rendered frame (`uniforms.dt` is [`DT`] / `solve_substeps`).
+    /// XPBD substeps per rendered frame (**per-substep** `uniforms.dt` ≈ smoothed wall Δ / `solve_substeps`, see [`sync_cloth_solve_budget_to_uniforms`]).
     ///
     /// More steps → stabler stiff constraints but more GPU dispatches (linear in this field).
     pub solve_substeps: u32,
@@ -161,7 +190,7 @@ pub struct ClothSimUniforms {
 
 impl Default for ClothSimUniforms {
     fn default() -> Self {
-        let sdt = DT / SUBSTEPS as f32;
+        let sdt = REFERENCE_FRAME_DELTA_SECS / SUBSTEPS as f32;
         Self {
             dt: sdt,
             inv_dt: 1.0 / sdt,
@@ -360,13 +389,24 @@ struct ClothSimLabel;
 fn sync_cloth_solve_budget_to_uniforms(
     cfg: Option<Res<ClothSimConfig>>,
     mut uniforms: ResMut<ClothSimUniforms>,
+    mut timing: ResMut<ClothSimFrameTiming>,
+    time: Res<Time>,
 ) {
     let Some(cfg) = cfg else {
         return;
     };
     let s = cfg.solve_substeps.max(1);
     let i = cfg.solve_inner_iterations.max(1);
-    uniforms.dt = DT / s as f32;
+    let raw = time
+        .delta_secs()
+        .max(MIN_FRAME_DELTA_SECS)
+        .min(timing.max_wall_delta_secs);
+    let a = timing.blend_alpha.clamp(0.0, 1.0);
+    let frame_dt =
+        timing.smoothed_wall_delta_secs * (1.0 - a) + raw * a;
+    timing.smoothed_wall_delta_secs = frame_dt;
+    // uniforms.dt = frame_dt / s as f32;
+    uniforms.dt = REFERENCE_FRAME_DELTA_SECS / s as f32;
     uniforms.inv_dt = 1.0 / uniforms.dt;
     uniforms.inner_iterations = i;
 }
@@ -376,6 +416,7 @@ pub struct ClothComputePlugin;
 impl Plugin for ClothComputePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ClothSimControl>();
+        app.init_resource::<ClothSimFrameTiming>();
         app.add_systems(
             PreUpdate,
             sync_cloth_solve_budget_to_uniforms.run_if(resource_exists::<ClothSimConfig>),

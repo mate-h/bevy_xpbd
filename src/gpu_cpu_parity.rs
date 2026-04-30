@@ -7,7 +7,8 @@ use std::path::Path;
 use bevy::math::{Vec3, Vec4};
 
 use crate::cloth_compute::{
-    ClothCollGridGpu, ClothCollRadixPassGpu, ClothSimParamsGpu, ClothSimUniforms, DT,
+    ClothCollGridGpu, ClothCollRadixPassGpu, ClothSimParamsGpu, ClothSimUniforms,
+    REFERENCE_FRAME_DELTA_SECS,
     GS_BATCH_DYNAMIC_STRIDE, GS_EDGE_THREADS, INNER_ITERS, SUBSTEPS, THICKNESS,
 };
 use crate::mesh_prep::ClothMeshData;
@@ -860,7 +861,7 @@ mod tests {
         assert_eq!(mesh.num_particles, 3);
         let n = mesh.num_particles;
 
-        let sdt = DT / SUBSTEPS as f32;
+        let sdt = REFERENCE_FRAME_DELTA_SECS / SUBSTEPS as f32;
         let mut u = ClothSimUniforms {
             dt: sdt,
             inv_dt: 1.0 / sdt,
@@ -949,7 +950,7 @@ mod tests {
         let mesh = crate::mesh_prep::grid_cloth_hanging(18, 18, 0.042);
         let n = mesh.num_particles;
 
-        let sdt = DT / SUBSTEPS as f32;
+        let sdt = REFERENCE_FRAME_DELTA_SECS / SUBSTEPS as f32;
         let mut u = ClothSimUniforms::default();
         u.dt = sdt;
         u.inv_dt = 1.0 / sdt;

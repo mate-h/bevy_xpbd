@@ -388,7 +388,7 @@ pub fn xpbd_frame_with_self_collision(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cloth_compute::{ClothSimUniforms, DT, INNER_ITERS};
+    use crate::cloth_compute::{ClothSimUniforms, INNER_ITERS, REFERENCE_FRAME_DELTA_SECS};
     use crate::mesh_prep::{grid_cloth_hanging, parse_welded_obj, ClothMeshData};
     use bevy::math::Vec4Swizzles;
 
@@ -415,7 +415,7 @@ mod tests {
         let cloth = cloth_test_grid();
         let n = cloth.num_particles as usize;
         let u = ClothSimUniforms::default();
-        let sdt = DT / SUBSTEPS as f32;
+        let sdt = REFERENCE_FRAME_DELTA_SECS / SUBSTEPS as f32;
 
         let mut sim_pos: Vec<Vec3> = cloth.positions.clone();
         let mut prev_pos = vec![Vec3::ZERO; n];
@@ -458,7 +458,7 @@ mod tests {
         let cloth = cloth_test_grid();
         let n = cloth.num_particles as usize;
         let u = ClothSimUniforms::default();
-        let sdt = DT / SUBSTEPS as f32;
+        let sdt = REFERENCE_FRAME_DELTA_SECS / SUBSTEPS as f32;
 
         let mut sim_pos: Vec<Vec3> = cloth.positions.clone();
         let mut prev_pos = vec![Vec3::ZERO; n];
@@ -503,7 +503,7 @@ mod tests {
         let cloth = cloth_test_grid();
         let n = cloth.num_particles as usize;
         let u = ClothSimUniforms::default();
-        let sdt = DT / SUBSTEPS as f32;
+        let sdt = REFERENCE_FRAME_DELTA_SECS / SUBSTEPS as f32;
 
         let rest = cloth.positions.clone();
         let mut sim_pos = rest.clone();
@@ -568,7 +568,7 @@ f 1/1 2/2 3/3
         assert_eq!(cloth.num_particles, 3);
         let n = 3;
         let u = ClothSimUniforms::default();
-        let sdt = DT / SUBSTEPS as f32;
+        let sdt = REFERENCE_FRAME_DELTA_SECS / SUBSTEPS as f32;
 
         let mut sim_pos = cloth.positions.clone();
         let mut prev_pos = vec![Vec3::ZERO; n];
@@ -613,7 +613,7 @@ f 1/1 2/2 3/3
         let cloth = cloth_test_grid();
         let n = cloth.num_particles as usize;
         let u = ClothSimUniforms::default();
-        let sdt = DT / SUBSTEPS as f32;
+        let sdt = REFERENCE_FRAME_DELTA_SECS / SUBSTEPS as f32;
 
         let mut sim_pos: Vec<Vec3> = cloth.positions.clone();
         let mut prev_pos = vec![Vec3::ZERO; n];
@@ -715,7 +715,7 @@ f 1/1 2/2 3/3
         let cloth = cloth_test_grid();
         let n = cloth.num_particles as usize;
         let u = ClothSimUniforms::default();
-        let sdt = DT / SUBSTEPS as f32;
+        let sdt = REFERENCE_FRAME_DELTA_SECS / SUBSTEPS as f32;
         let rest = cloth.positions.clone();
 
         let mut sim_pos: Vec<Vec3> = rest.clone();
