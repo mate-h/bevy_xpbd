@@ -1,12 +1,16 @@
 struct SimParams {
     dt: f32,
     inv_dt: f32,
+    inv_dt_sq: f32,
+    constraint_batch_count: u32,
     num_particles: u32,
     num_tris: u32,
     jacobi_omega: f32,
     inner_iterations: u32,
     thickness: f32,
     coll_scale: f32,
+    /// Aligns **`gravity`** to 16 bytes (matches Rust `ClothSimParamsGpu`).
+    _pad_before_gravity: vec2<f32>,
     gravity: vec4<f32>,
     grab_target: vec4<f32>,
     grab_idx: i32,
@@ -14,41 +18,57 @@ struct SimParams {
     grab_stiffness: f32,
     floor_y: f32,
     linear_drag_per_sec: f32,
+    // Unused (legacy layout); real batch index is binding(19) dynamic uniform `gs_dyn_batch`.
+    constraint_batch_idx: u32,
+    _uniform_pad_vec2_u: vec2<u32>,
+    _uniform_pad_vec2_f: vec2<f32>,
+    _uniform_encase_reserve: vec2<u32>,
 }
 
 @group(0) @binding(0) var<uniform> params: SimParams;
 @group(0) @binding(1) var<storage, read_write> sim_pos: array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read> jac_in: array<vec4<f32>>;
-@group(0) @binding(3) var<storage, read_write> jac_out: array<vec4<f32>>;
-@group(0) @binding(4) var<storage, read_write> prev_pos: array<vec4<f32>>;
-@group(0) @binding(5) var<storage, read_write> velocities: array<vec4<f32>>;
-@group(0) @binding(6) var<storage, read> rest_pos: array<vec4<f32>>;
-@group(0) @binding(7) var<storage, read> inv_mass: array<f32>;
-@group(0) @binding(8) var<storage, read> neighbor_offsets: array<u32>;
-@group(0) @binding(9) var<storage, read> neighbor_packed: array<vec4<f32>>;
-@group(0) @binding(10) var<storage, read> constraint_i: array<u32>;
-@group(0) @binding(11) var<storage, read> constraint_j: array<u32>;
-@group(0) @binding(12) var<storage, read> constraint_rest: array<f32>;
-@group(0) @binding(13) var<storage, read> constraint_comp: array<f32>;
-@group(0) @binding(14) var<storage, read_write> constraint_lambda: array<f32>;
-@group(0) @binding(15) var<storage, read_write> constraint_delta_lambda: array<f32>;
-@group(0) @binding(16) var<storage, read> tri_indices: array<u32>;
-@group(0) @binding(17) var<storage, read_write> render_positions: array<vec4<f32>>;
-@group(0) @binding(18) var<storage, read_write> render_normals: array<vec4<f32>>;
-@group(0) @binding(19) var<storage, read_write> atomic_coll: array<atomic<i32>>;
-@group(0) @binding(20) var<storage, read_write> atomic_norm: array<atomic<i32>>;
+@group(0) @binding(2) var<storage, read_write> jac_state: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> prev_pos: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read_write> velocities: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read> rest_pos: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read> inv_mass: array<f32>;
+@group(0) @binding(7) var<storage, read> constraint_batch_offsets: array<u32>;
+@group(0) @binding(8) var<storage, read> constraint_i: array<u32>;
+@group(0) @binding(9) var<storage, read> constraint_j: array<u32>;
+@group(0) @binding(10) var<storage, read> constraint_rest: array<f32>;
+@group(0) @binding(11) var<storage, read> constraint_comp: array<f32>;
+@group(0) @binding(12) var<storage, read_write> constraint_lambda: array<f32>;
+@group(0) @binding(13) var<storage, read_write> constraint_delta_lambda: array<f32>;
+@group(0) @binding(14) var<storage, read> tri_indices: array<u32>;
+@group(0) @binding(15) var<storage, read_write> render_positions: array<vec4<f32>>;
+@group(0) @binding(16) var<storage, read_write> render_normals: array<vec4<f32>>;
+@group(0) @binding(17) var<storage, read_write> atomic_coll: array<atomic<i32>>;
+@group(0) @binding(18) var<storage, read_write> atomic_norm: array<atomic<i32>>;
+/// One 256‑byte dynamic slot (`min_uniform_buffer_offset_alignment`). `head.x` holds the batch index.
+/// `array<u32>` padding is invalid in uniform address space (stride must be ≥16).
+struct GsDynBatchUniform {
+    head: vec4<u32>,
+    _pad_bulk: array<vec4<u32>, 15>,
+}
+@group(0) @binding(19) var<uniform> gs_dyn_batch: GsDynBatchUniform;
 
 const FIXSCALE: i32 = 10000;
+/// Match `JACOBI_CORRECTION_CAP` in `cloth_compute.rs` (applied per particle per edge correction).
+const GS_CORRECTION_CAP: f32 = 0.28;
 
-@compute @workgroup_size(64, 1, 1)
-fn predict(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= params.num_particles) {
-        return;
+fn clamp_delta_vec(dx: vec3<f32>) -> vec3<f32> {
+    let ml = length(dx);
+    if (ml > GS_CORRECTION_CAP && ml > 0.0) {
+        return dx * (GS_CORRECTION_CAP / ml);
     }
+    return dx;
+}
+
+fn xpbd_predict_then_write_jac_row(i: u32) {
     let w = inv_mass[i];
     if (w <= 0.0) {
         prev_pos[i] = sim_pos[i];
+        jac_state[i] = sim_pos[i];
         return;
     }
     var v = velocities[i].xyz;
@@ -69,15 +89,17 @@ fn predict(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     sim_pos[i] = vec4<f32>(p, 0.0);
     velocities[i] = vec4<f32>(v, 0.0);
+    jac_state[i] = sim_pos[i];
 }
 
+/// Gravity / floor / grab integration, then copy **`sim_pos` → `jac_state`** so GS reads fresh positions in one barrier.
 @compute @workgroup_size(64, 1, 1)
-fn copy_sim_to_jac(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn predict_copy_sim_to_jac(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= params.num_particles) {
         return;
     }
-    jac_out[i] = sim_pos[i];
+    xpbd_predict_then_write_jac_row(i);
 }
 
 @compute @workgroup_size(64, 1, 1)
@@ -86,19 +108,10 @@ fn copy_jac_to_sim(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.num_particles) {
         return;
     }
-    sim_pos[i] = jac_in[i];
+    sim_pos[i] = jac_state[i];
 }
 
-@compute @workgroup_size(64, 1, 1)
-fn copy_positions(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= params.num_particles) {
-        return;
-    }
-    jac_out[i] = jac_in[i];
-}
-
-/// XPBD Eq. (18): Δλ = (−C − α̃λ) / (w_i + w_j + α̃); λ is cleared before each Jacobi inner iteration (see `cloth_compute`).
+// Zero λ before each GS inner iteration.
 @compute @workgroup_size(64, 1, 1)
 fn clear_constraint_lambda(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -110,13 +123,20 @@ fn clear_constraint_lambda(@builtin(global_invocation_id) gid: vec3<u32>) {
     constraint_delta_lambda[i] = 0.0;
 }
 
-@compute @workgroup_size(64, 1, 1)
-fn jacobi_edges(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let e = gid.x;
-    let nc = arrayLength(&constraint_i);
-    if (e >= nc) {
+// XPBD distance constraints for one GS color batch; `gs_dyn_batch.head.x` via dynamic uniform offset.
+@compute @workgroup_size(128, 1, 1)
+fn gs_edges(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let b = gs_dyn_batch.head.x;
+    if (params.constraint_batch_count == 0u || b >= params.constraint_batch_count) {
         return;
     }
+    let start = constraint_batch_offsets[b];
+    let end = constraint_batch_offsets[b + 1u];
+    let e = gid.x + start;
+    if (e >= end) {
+        return;
+    }
+
     let i = constraint_i[e];
     let j = constraint_j[e];
     let w_i = inv_mass[i];
@@ -127,8 +147,8 @@ fn jacobi_edges(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let rest = constraint_rest[e];
     let compliance = constraint_comp[e];
-    let p_i = jac_in[i].xyz;
-    let p_j = jac_in[j].xyz;
+    let p_i = jac_state[i].xyz;
+    let p_j = jac_state[j].xyz;
     var gv = p_i - p_j;
     let len = length(gv);
     if (len < 1e-8) {
@@ -137,7 +157,7 @@ fn jacobi_edges(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     gv = gv / len;
     let C = len - rest;
-    let alpha_t = compliance / (params.dt * params.dt);
+    let alpha_t = compliance * params.inv_dt_sq;
     let wsum = w_i + w_j + alpha_t;
     if (wsum < 1e-8) {
         constraint_delta_lambda[e] = 0.0;
@@ -147,49 +167,18 @@ fn jacobi_edges(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dlam = (-C - alpha_t * lambda_e) / wsum;
     constraint_delta_lambda[e] = dlam;
     constraint_lambda[e] = lambda_e + dlam;
-}
 
-/// Sum Δx_i = w_i ∇C_i Δλ per incident constraint (same Δλ as edge pass). Matches Δx = M⁻¹∇Cᵀ Δλ (Eq. 17).
-@compute @workgroup_size(64, 1, 1)
-fn jacobi_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= params.num_particles) {
-        return;
+    let omega = params.jacobi_omega;
+    var dx_i = omega * gv * w_i * dlam;
+    var dx_j = -(omega * gv * w_j * dlam);
+    dx_i = clamp_delta_vec(dx_i);
+    dx_j = clamp_delta_vec(dx_j);
+    if (w_i > 0.0) {
+        jac_state[i] = vec4<f32>(p_i + dx_i, 0.0);
     }
-    let w_i = inv_mass[i];
-    if (w_i <= 0.0) {
-        jac_out[i] = jac_in[i];
-        return;
+    if (w_j > 0.0) {
+        jac_state[j] = vec4<f32>(p_j + dx_j, 0.0);
     }
-    let p_i = jac_in[i].xyz;
-    var acc = vec3<f32>(0.0);
-    let start = neighbor_offsets[i];
-    let end = neighbor_offsets[i + 1u];
-    for (var k = start; k < end; k++) {
-        let pack = neighbor_packed[k];
-        let j = u32(pack.x);
-        let w_j = inv_mass[j];
-        if (w_j <= 0.0 && w_i <= 0.0) {
-            continue;
-        }
-        let p_j = jac_in[j].xyz;
-        var gv = p_i - p_j;
-        let len = length(gv);
-        if (len < 1e-8) {
-            continue;
-        }
-        gv = gv / len;
-        let eid = u32(pack.w);
-        let dlam = constraint_delta_lambda[eid];
-        acc = acc + gv * w_i * dlam;
-    }
-    var delta = params.jacobi_omega * acc;
-    let ml = length(delta);
-    let cap = 0.28;
-    if (ml > cap && ml > 0.0) {
-        delta = delta * (cap / ml);
-    }
-    jac_out[i] = vec4<f32>(p_i + delta, 0.0);
 }
 
 @compute @workgroup_size(64, 1, 1)
@@ -202,7 +191,6 @@ fn post_velocity(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     var v = (sim_pos[i].xyz - prev_pos[i].xyz) * params.inv_dt;
-    // Linear drag: v *= exp(-k * dt_sub), k = linear_drag_per_sec (see `DEFAULT_LINEAR_AIR_DRAG_PER_SEC`).
     let damp = exp(-params.linear_drag_per_sec * params.dt);
     v = v * damp;
     velocities[i] = vec4<f32>(v, 0.0);
@@ -222,6 +210,9 @@ fn clear_atomics(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(256, 1, 1)
 fn collide_pairs(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (params.coll_scale <= 0.0) {
+        return;
+    }
     let pair_id = gid.x;
     let n = params.num_particles;
     let total = n * (n - 1u) / 2u;
@@ -300,8 +291,6 @@ fn collide_apply(@builtin(global_invocation_id) gid: vec3<u32>) {
     var sx = f32(atomicLoad(&atomic_coll[i * 3u + 0u])) / f32(FIXSCALE);
     var sy = f32(atomicLoad(&atomic_coll[i * 3u + 1u])) / f32(FIXSCALE);
     var sz = f32(atomicLoad(&atomic_coll[i * 3u + 2u])) / f32(FIXSCALE);
-    // Avoid i32 atomic overflow / runaway stacking from collapsing the mesh in one substep.
-    // Keep in sync with `COLLISION_APPLY_CLAMP` in `cloth_compute.rs`.
     let max_d = 0.35;
     sx = clamp(sx, -max_d, max_d);
     sy = clamp(sy, -max_d, max_d);

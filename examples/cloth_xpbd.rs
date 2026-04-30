@@ -11,7 +11,7 @@ use bevy::render::storage::ShaderStorageBuffer;
 use bevy_xpbd::{
     cloth_compute::{
         ClothComputePlugin, ClothSimConfig, ClothSimControl, ClothSimUniforms, DEFAULT_COLL_SCALE,
-        DT, SUBSTEPS, THICKNESS,
+        THICKNESS,
     },
     cloth_material::{ClothMaterialPlugin, ClothMatExt},
     mesh_prep::{grid_cloth_hanging, parse_welded_obj, ClothMeshData},
@@ -20,7 +20,8 @@ use bevy_xpbd::{
 /// Relative to the crate root (`CARGO_MANIFEST_DIR`).
 const CLOTH_OBJ_PATH: &str = "assets/cloth.obj";
 
-/// Procedural fallback — if sim still jitters, raise `SUBSTEPS`/`INNER_ITERS` in `cloth_compute` or increase `cell_size` / reduce quad counts.
+/// Procedural fallback — if sim jitters or stretches, restore defaults via `solve_substeps: 36`,
+/// `solve_inner_iterations: 22` (`bevy_xpbd::cloth_compute`) or widen `cell_size` / simpler mesh.
 const CLOTH_QUAD_COLS: u32 = 24;
 const CLOTH_QUAD_ROWS: u32 = 18;
 const CLOTH_CELL_SIZE: f32 = 0.045;
@@ -82,7 +83,7 @@ fn main() {
         .insert_resource(ClothSimUniforms::default())
         .insert_resource(GrabState::default())
         .add_systems(Startup, setup)
-        .add_systems(Update, (update_uniforms, mouse_grab, cloth_sim_debug_keys))
+        .add_systems(Update, (mouse_grab, cloth_sim_debug_keys))
         .run();
 }
 
@@ -105,6 +106,11 @@ fn setup(
     }
 
     commands.insert_resource(ClothSimConfig {
+        // ~40% fewer total dispatches vs (36×22) at typical `B`; raise both if seams stretch.
+        solve_substeps: 24,
+        solve_inner_iterations: 14,
+        // Halves pairwise self-collision work when `coll_scale > 0` (runs on odd-indexed substeps).
+        collision_every_n_substeps: 2,
         render_positions: config.render_positions.clone(),
         render_normals: config.render_normals.clone(),
         ..config
@@ -152,11 +158,6 @@ fn cloth_sim_debug_keys(mut ctrl: ResMut<ClothSimControl>, keys: Res<ButtonInput
     if keys.just_pressed(KeyCode::KeyN) {
         ctrl.step_serial = ctrl.step_serial.saturating_add(1);
     }
-}
-
-fn update_uniforms(mut u: ResMut<ClothSimUniforms>) {
-    u.dt = DT / SUBSTEPS as f32;
-    u.inv_dt = 1.0 / u.dt;
 }
 
 fn mouse_grab(

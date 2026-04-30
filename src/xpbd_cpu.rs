@@ -1,7 +1,6 @@
 //! CPU reference for the GPU XPBD loop in `cloth_sim.wgsl` (optional self-collision; no normals).
-//! Neighbor data uses the same flat layout as [`crate::mesh_prep::ClothMeshData`] (`neighbor_other`,
-//! `neighbor_rest_len`, `neighbor_compliance`, `neighbor_constraint_id`, `neighbor_offsets`) plus
-//! compact `constraint_*` arrays — GPU packs constraint id in `neighbor_packed.w`.
+//! Uses the same `constraint_*` row order / batch coloring as [`crate::mesh_prep::ClothMeshData`]
+//! (Gauss–Seidel: one in-place jac buffer; constraints processed in contiguous index order).
 
 use bevy::math::Vec3;
 
@@ -9,7 +8,7 @@ use crate::cloth_compute::{
     COLLISION_APPLY_CLAMP, JACOBI_CORRECTION_CAP, PREDICT_MAX_SPEED, SUBSTEPS,
 };
 
-/// Uniform inputs needed for predict + Jacobi (collision stripped).
+/// Uniform inputs needed for predict + GS constraints (collision stripped).
 #[derive(Clone, Debug)]
 pub struct XpbdCpuTimeStepParams {
     pub dt: f32,
@@ -27,102 +26,14 @@ pub struct XpbdCpuTimeStepParams {
     pub linear_drag_per_sec: f32,
 }
 
-fn jacobi_edges_pass(
-    jac_in: &[Vec3],
-    inv_mass: &[f32],
-    constraint_i: &[u32],
-    constraint_j: &[u32],
-    constraint_rest: &[f32],
-    constraint_comp: &[f32],
-    lambda: &mut [f32],
-    delta_lambda: &mut [f32],
-    dt: f32,
-) {
-    let e_count = constraint_i.len();
-    debug_assert_eq!(constraint_j.len(), e_count);
-    debug_assert_eq!(constraint_rest.len(), e_count);
-    debug_assert_eq!(constraint_comp.len(), e_count);
-    debug_assert_eq!(lambda.len(), e_count);
-    debug_assert_eq!(delta_lambda.len(), e_count);
-
-    for e in 0..e_count {
-        let i = constraint_i[e] as usize;
-        let j = constraint_j[e] as usize;
-        let w_i = inv_mass[i];
-        let w_j = inv_mass[j];
-        if w_j <= 0.0 && w_i <= 0.0 {
-            delta_lambda[e] = 0.0;
-            continue;
-        }
-        let rest = constraint_rest[e];
-        let compliance = constraint_comp[e];
-        let p_i = jac_in[i];
-        let p_j = jac_in[j];
-        let mut gv = p_i - p_j;
-        let len = gv.length();
-        if len < 1e-8 {
-            delta_lambda[e] = 0.0;
-            continue;
-        }
-        gv /= len;
-        let c = len - rest;
-        let alpha_t = compliance / (dt * dt);
-        let wsum = w_i + w_j + alpha_t;
-        if wsum < 1e-8 {
-            delta_lambda[e] = 0.0;
-            continue;
-        }
-        let lam = lambda[e];
-        let dlam = (-c - alpha_t * lam) / wsum;
-        delta_lambda[e] = dlam;
-        lambda[e] = lam + dlam;
-    }
-}
-
-fn jacobi_gather_particle(
-    i: usize,
-    jac_in: &[Vec3],
-    inv_mass: &[f32],
-    neighbor_offsets: &[u32],
-    neighbor_other: &[u32],
-    neighbor_constraint_id: &[u32],
-    delta_lambda: &[f32],
-    jacobi_omega: f32,
-) -> Vec3 {
-    let w_i = inv_mass[i];
-    if w_i <= 0.0 {
-        return jac_in[i];
-    }
-    let p_i = jac_in[i];
-    let mut acc = Vec3::ZERO;
-    let start = neighbor_offsets[i] as usize;
-    let end = neighbor_offsets[i + 1] as usize;
-    debug_assert_eq!(neighbor_constraint_id.len(), neighbor_other.len());
-
-    for k in start..end {
-        let j = neighbor_other[k] as usize;
-        let w_j = inv_mass[j];
-        if w_j <= 0.0 && w_i <= 0.0 {
-            continue;
-        }
-        let p_j = jac_in[j];
-        let mut gv = p_i - p_j;
-        let len = gv.length();
-        if len < 1e-8 {
-            continue;
-        }
-        gv /= len;
-        let eid = neighbor_constraint_id[k] as usize;
-        let dlam = delta_lambda[eid];
-        acc += gv * w_i * dlam;
-    }
-    let mut delta = jacobi_omega * acc;
-    let ml = delta.length();
+fn clamp_correction(dx: Vec3) -> Vec3 {
+    let ml = dx.length();
     let cap = JACOBI_CORRECTION_CAP;
     if ml > cap && ml > 0.0 {
-        delta *= cap / ml;
+        dx * (cap / ml)
+    } else {
+        dx
     }
-    p_i + delta
 }
 
 fn predict_particle(
@@ -230,12 +141,8 @@ fn xpbd_substep_integrate(
     sim_pos: &mut [Vec3],
     prev_pos: &mut [Vec3],
     vel: &mut [Vec3],
-    jac_a: &mut [Vec3],
-    jac_b: &mut [Vec3],
+    jac_work: &mut [Vec3],
     inv_mass: &[f32],
-    neighbor_offsets: &[u32],
-    neighbor_other: &[u32],
-    neighbor_constraint_id: &[u32],
     constraint_i: &[u32],
     constraint_j: &[u32],
     constraint_rest_len: &[f32],
@@ -245,14 +152,11 @@ fn xpbd_substep_integrate(
     let n = sim_pos.len();
     debug_assert_eq!(prev_pos.len(), n);
     debug_assert_eq!(vel.len(), n);
-    debug_assert_eq!(jac_a.len(), n);
-    debug_assert_eq!(jac_b.len(), n);
+    debug_assert_eq!(jac_work.len(), n);
     debug_assert_eq!(inv_mass.len(), n);
-    debug_assert_eq!(neighbor_offsets.len(), n + 1);
 
     let num_constraints = constraint_i.len();
     let mut lambda = vec![0f32; num_constraints];
-    let mut delta_lambda = vec![0f32; num_constraints];
 
     for i in 0..n {
         if inv_mass[i] <= 0.0 {
@@ -266,52 +170,59 @@ fn xpbd_substep_integrate(
     }
 
     for i in 0..n {
-        jac_b[i] = sim_pos[i];
+        jac_work[i] = sim_pos[i];
     }
 
     for _k in 0..p.inner_iterations {
         lambda.fill(0.0);
-        delta_lambda.fill(0.0);
+        debug_assert_eq!(constraint_j.len(), num_constraints);
+        debug_assert_eq!(constraint_rest_len.len(), num_constraints);
+        debug_assert_eq!(constraint_compliance.len(), num_constraints);
 
-        let (read, write): (&[Vec3], &mut [Vec3]) = if _k % 2 == 0 {
-            (&*jac_b, jac_a)
-        } else {
-            (&*jac_a, jac_b)
-        };
+        let omega = p.jacobi_omega;
+        let dt = p.dt;
 
-        jacobi_edges_pass(
-            read,
-            inv_mass,
-            constraint_i,
-            constraint_j,
-            constraint_rest_len,
-            constraint_compliance,
-            &mut lambda,
-            &mut delta_lambda,
-            p.dt,
-        );
+        for e in 0..num_constraints {
+            let i = constraint_i[e] as usize;
+            let j = constraint_j[e] as usize;
+            let w_i = inv_mass[i];
+            let w_j = inv_mass[j];
+            if w_j <= 0.0 && w_i <= 0.0 {
+                continue;
+            }
+            let rest = constraint_rest_len[e];
+            let compliance = constraint_compliance[e];
+            let p_i = jac_work[i];
+            let p_j = jac_work[j];
+            let mut gv = p_i - p_j;
+            let len = gv.length();
+            if len < 1e-8 {
+                continue;
+            }
+            gv /= len;
+            let c = len - rest;
+            let alpha_t = compliance / (dt * dt);
+            let wsum = w_i + w_j + alpha_t;
+            if wsum < 1e-8 {
+                continue;
+            }
+            let lam = lambda[e];
+            let dlam = (-c - alpha_t * lam) / wsum;
+            lambda[e] = lam + dlam;
 
-        for i in 0..n {
-            write[i] = jacobi_gather_particle(
-                i,
-                read,
-                inv_mass,
-                neighbor_offsets,
-                neighbor_other,
-                neighbor_constraint_id,
-                &delta_lambda,
-                p.jacobi_omega,
-            );
+            let dx_i = clamp_correction(omega * gv * w_i * dlam);
+            let dx_j = clamp_correction(-(omega * gv * w_j * dlam));
+            if w_i > 0.0 {
+                jac_work[i] = p_i + dx_i;
+            }
+            if w_j > 0.0 {
+                jac_work[j] = p_j + dx_j;
+            }
         }
     }
 
-    let final_jac: &[Vec3] = if p.inner_iterations % 2 == 0 {
-        jac_b
-    } else {
-        jac_a
-    };
     for i in 0..n {
-        sim_pos[i] = final_jac[i];
+        sim_pos[i] = jac_work[i];
     }
 }
 
@@ -333,17 +244,13 @@ fn xpbd_substep_post_velocity(
     }
 }
 
-/// One GPU **substep** (predict → Jacobi × K → sim ← jac → post_velocity), no collision.
+/// One GPU **substep** (predict → GS × K → sim ← jac → post_velocity), no collision.
 pub fn xpbd_substep_no_collision(
     sim_pos: &mut [Vec3],
     prev_pos: &mut [Vec3],
     vel: &mut [Vec3],
-    jac_a: &mut [Vec3],
-    jac_b: &mut [Vec3],
+    jac_work: &mut [Vec3],
     inv_mass: &[f32],
-    neighbor_offsets: &[u32],
-    neighbor_other: &[u32],
-    neighbor_constraint_id: &[u32],
     constraint_i: &[u32],
     constraint_j: &[u32],
     constraint_rest_len: &[f32],
@@ -354,12 +261,8 @@ pub fn xpbd_substep_no_collision(
         sim_pos,
         prev_pos,
         vel,
-        jac_a,
-        jac_b,
+        jac_work,
         inv_mass,
-        neighbor_offsets,
-        neighbor_other,
-        neighbor_constraint_id,
         constraint_i,
         constraint_j,
         constraint_rest_len,
@@ -377,17 +280,13 @@ pub fn xpbd_substep_no_collision(
     );
 }
 
-/// Like [`xpbd_substep_no_collision`], but runs [`self_collision_resolve`] after Jacobi (same order as the render graph).
+/// Like [`xpbd_substep_no_collision`], but runs [`self_collision_resolve`] after constraints (same order as the render graph).
 pub fn xpbd_substep_with_self_collision(
     sim_pos: &mut [Vec3],
     prev_pos: &mut [Vec3],
     vel: &mut [Vec3],
-    jac_a: &mut [Vec3],
-    jac_b: &mut [Vec3],
+    jac_work: &mut [Vec3],
     inv_mass: &[f32],
-    neighbor_offsets: &[u32],
-    neighbor_other: &[u32],
-    neighbor_constraint_id: &[u32],
     constraint_i: &[u32],
     constraint_j: &[u32],
     constraint_rest_len: &[f32],
@@ -402,12 +301,8 @@ pub fn xpbd_substep_with_self_collision(
         sim_pos,
         prev_pos,
         vel,
-        jac_a,
-        jac_b,
+        jac_work,
         inv_mass,
-        neighbor_offsets,
-        neighbor_other,
-        neighbor_constraint_id,
         constraint_i,
         constraint_j,
         constraint_rest_len,
@@ -431,12 +326,8 @@ pub fn xpbd_frame_no_collision(
     sim_pos: &mut [Vec3],
     prev_pos: &mut [Vec3],
     vel: &mut [Vec3],
-    jac_a: &mut [Vec3],
-    jac_b: &mut [Vec3],
+    jac_work: &mut [Vec3],
     inv_mass: &[f32],
-    neighbor_offsets: &[u32],
-    neighbor_other: &[u32],
-    neighbor_constraint_id: &[u32],
     constraint_i: &[u32],
     constraint_j: &[u32],
     constraint_rest_len: &[f32],
@@ -448,12 +339,8 @@ pub fn xpbd_frame_no_collision(
             sim_pos,
             prev_pos,
             vel,
-            jac_a,
-            jac_b,
+            jac_work,
             inv_mass,
-            neighbor_offsets,
-            neighbor_other,
-            neighbor_constraint_id,
             constraint_i,
             constraint_j,
             constraint_rest_len,
@@ -468,12 +355,8 @@ pub fn xpbd_frame_with_self_collision(
     sim_pos: &mut [Vec3],
     prev_pos: &mut [Vec3],
     vel: &mut [Vec3],
-    jac_a: &mut [Vec3],
-    jac_b: &mut [Vec3],
+    jac_work: &mut [Vec3],
     inv_mass: &[f32],
-    neighbor_offsets: &[u32],
-    neighbor_other: &[u32],
-    neighbor_constraint_id: &[u32],
     constraint_i: &[u32],
     constraint_j: &[u32],
     constraint_rest_len: &[f32],
@@ -488,12 +371,8 @@ pub fn xpbd_frame_with_self_collision(
             sim_pos,
             prev_pos,
             vel,
-            jac_a,
-            jac_b,
+            jac_work,
             inv_mass,
-            neighbor_offsets,
-            neighbor_other,
-            neighbor_constraint_id,
             constraint_i,
             constraint_j,
             constraint_rest_len,
@@ -541,8 +420,7 @@ mod tests {
         let mut sim_pos: Vec<Vec3> = cloth.positions.clone();
         let mut prev_pos = vec![Vec3::ZERO; n];
         let mut vel = vec![Vec3::ZERO; n];
-        let mut jac_a = vec![Vec3::ZERO; n];
-        let mut jac_b = vec![Vec3::ZERO; n];
+        let mut jac_work = vec![Vec3::ZERO; n];
 
         let sub = XpbdCpuTimeStepParams {
             dt: sdt,
@@ -562,12 +440,8 @@ mod tests {
             &mut sim_pos,
             &mut prev_pos,
             &mut vel,
-            &mut jac_a,
-            &mut jac_b,
+            &mut jac_work,
             &cloth.inv_mass,
-            &cloth.neighbor_offsets,
-            &cloth.neighbor_other,
-            &cloth.neighbor_constraint_id,
             &cloth.constraint_i,
             &cloth.constraint_j,
             &cloth.constraint_rest_len,
@@ -578,7 +452,7 @@ mod tests {
         assert!(sim_pos.iter().all(|p| p.is_finite()));
     }
 
-    /// Full GPU-matching substep count + Jacobi on real cloth data (no collision).
+    /// Full GPU-matching substep count + GS constraints on real cloth data (no collision).
     #[test]
     fn cpu_xpbd_cloth_one_frame_full_solver_stays_finite() {
         let cloth = cloth_test_grid();
@@ -589,8 +463,7 @@ mod tests {
         let mut sim_pos: Vec<Vec3> = cloth.positions.clone();
         let mut prev_pos = vec![Vec3::ZERO; n];
         let mut vel = vec![Vec3::ZERO; n];
-        let mut jac_a = vec![Vec3::ZERO; n];
-        let mut jac_b = vec![Vec3::ZERO; n];
+        let mut jac_work = vec![Vec3::ZERO; n];
 
         let sub = XpbdCpuTimeStepParams {
             dt: sdt,
@@ -610,12 +483,8 @@ mod tests {
             &mut sim_pos,
             &mut prev_pos,
             &mut vel,
-            &mut jac_a,
-            &mut jac_b,
+            &mut jac_work,
             &cloth.inv_mass,
-            &cloth.neighbor_offsets,
-            &cloth.neighbor_other,
-            &cloth.neighbor_constraint_id,
             &cloth.constraint_i,
             &cloth.constraint_j,
             &cloth.constraint_rest_len,
@@ -640,8 +509,7 @@ mod tests {
         let mut sim_pos = rest.clone();
         let mut prev_pos = vec![Vec3::ZERO; n];
         let mut vel = vec![Vec3::ZERO; n];
-        let mut jac_a = vec![Vec3::ZERO; n];
-        let mut jac_b = vec![Vec3::ZERO; n];
+        let mut jac_work = vec![Vec3::ZERO; n];
 
         let sub = XpbdCpuTimeStepParams {
             dt: sdt,
@@ -661,12 +529,8 @@ mod tests {
             &mut sim_pos,
             &mut prev_pos,
             &mut vel,
-            &mut jac_a,
-            &mut jac_b,
+            &mut jac_work,
             &cloth.inv_mass,
-            &cloth.neighbor_offsets,
-            &cloth.neighbor_other,
-            &cloth.neighbor_constraint_id,
             &cloth.constraint_i,
             &cloth.constraint_j,
             &cloth.constraint_rest_len,
@@ -709,8 +573,7 @@ f 1/1 2/2 3/3
         let mut sim_pos = cloth.positions.clone();
         let mut prev_pos = vec![Vec3::ZERO; n];
         let mut vel = vec![Vec3::ZERO; n];
-        let mut jac_a = vec![Vec3::ZERO; n];
-        let mut jac_b = vec![Vec3::ZERO; n];
+        let mut jac_work = vec![Vec3::ZERO; n];
 
         let sub = XpbdCpuTimeStepParams {
             dt: sdt,
@@ -730,12 +593,8 @@ f 1/1 2/2 3/3
             &mut sim_pos,
             &mut prev_pos,
             &mut vel,
-            &mut jac_a,
-            &mut jac_b,
+            &mut jac_work,
             &cloth.inv_mass,
-            &cloth.neighbor_offsets,
-            &cloth.neighbor_other,
-            &cloth.neighbor_constraint_id,
             &cloth.constraint_i,
             &cloth.constraint_j,
             &cloth.constraint_rest_len,
@@ -759,8 +618,7 @@ f 1/1 2/2 3/3
         let mut sim_pos: Vec<Vec3> = cloth.positions.clone();
         let mut prev_pos = vec![Vec3::ZERO; n];
         let mut vel = vec![Vec3::ZERO; n];
-        let mut jac_a = vec![Vec3::ZERO; n];
-        let mut jac_b = vec![Vec3::ZERO; n];
+        let mut jac_work = vec![Vec3::ZERO; n];
 
         let sub = XpbdCpuTimeStepParams {
             dt: sdt,
@@ -781,12 +639,8 @@ f 1/1 2/2 3/3
                 &mut sim_pos,
                 &mut prev_pos,
                 &mut vel,
-                &mut jac_a,
-                &mut jac_b,
+                &mut jac_work,
                 &cloth.inv_mass,
-                &cloth.neighbor_offsets,
-                &cloth.neighbor_other,
-                &cloth.neighbor_constraint_id,
                 &cloth.constraint_i,
                 &cloth.constraint_j,
                 &cloth.constraint_rest_len,
@@ -867,8 +721,7 @@ f 1/1 2/2 3/3
         let mut sim_pos: Vec<Vec3> = rest.clone();
         let mut prev_pos = vec![Vec3::ZERO; n];
         let mut vel = vec![Vec3::ZERO; n];
-        let mut jac_a = vec![Vec3::ZERO; n];
-        let mut jac_b = vec![Vec3::ZERO; n];
+        let mut jac_work = vec![Vec3::ZERO; n];
 
         let sub = XpbdCpuTimeStepParams {
             dt: sdt,
@@ -888,12 +741,8 @@ f 1/1 2/2 3/3
             &mut sim_pos,
             &mut prev_pos,
             &mut vel,
-            &mut jac_a,
-            &mut jac_b,
+            &mut jac_work,
             &cloth.inv_mass,
-            &cloth.neighbor_offsets,
-            &cloth.neighbor_other,
-            &cloth.neighbor_constraint_id,
             &cloth.constraint_i,
             &cloth.constraint_j,
             &cloth.constraint_rest_len,

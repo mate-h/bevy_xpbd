@@ -1,15 +1,25 @@
 //! GPU cloth XPBD simulation (compute) + render graph dispatch.
 //!
 //! Distance constraints follow **XPBD** (Macklin et al., Eq. 17–18): α̃ = α/Δt², Δλ = (−C − α̃λ)/(∑ w + α̃),
-//! Δx = M⁻¹∇Cᵀ Δλ. Jacobi clears **λ before each inner iteration** (parallel solves typically omit λ warm‑start
-//! across Jacobi sweeps — carrying λ between sweeps often oscillates dense cloth). Edge pass (`jacobi_edges`)
-//! plus gather (`jacobi_gather`). Compliance α comes from [`crate::mesh_prep`]
-//! (`DEFAULT_STRETCH_COMPLIANCE` / `DEFAULT_BEND_COMPLIANCE`).
+//! with **Gauss–Seidel** sequencing: corrections write straight into [`jac_state`], one **color batch** at a time
+//! (see [`ClothMeshData::constraint_batch_offsets`](crate::mesh_prep::ClothMeshData)). λ is cleared before each
+//! inner iteration. Compliance α comes from [`crate::mesh_prep`].
 //!
-//! **Stability:** Jacobi needs enough [`SUBSTEPS`] + [`INNER_ITERS`]; stretch α = 0 with few iterations often looks like edge-length “explosion”.
-//! Tune [`ClothSimUniforms::jacobi_omega`] down if the sheet oscillates; raise [`JACOBI_CORRECTION_CAP`] only if edges are long (cap truncates corrections).
+//! **Gauss–Seidel batches:** Each inner iteration clears λ (`clear_constraint_lambda`), then **`gs_edges`** per color batch. All inner iterations for a **substep** live in **`one`** labeled compute pass (`cloth_pass_distance_gauss_seidel`): ordered dispatches imply storage dependencies between clears and batches; dynamic uniform offsets on `binding(19)` (`GS_BATCH_DYNAMIC_STRIDE`) select each GS batch.
+//! One such pass runs **per substep** (**not per inner iteration**).
 //!
-//! **Note:** For the full write-up of what fixed dense-cloth blow-ups and the “ball” render artifact, see **`docs/CLOTH_SIM_STABILITY.md`** in this repo.
+//! **Dispatch counts:** with **`solve_substeps = S`**, **`solve_inner_iterations = I`**, mesh batch count `B`,
+//! **`predict_copy_sim_to_jac`** merges integrate + jac copy (**6** tail dispatches/substep vs 7 historically):
+//! base **`S * (6 + I * (B + 1)) + 3`** per frame (`ClothSimNode`).
+//! Omit **`clear_atomics` + `collide_pairs` + `collide_apply`** when **`coll_scale ≤ 0`** or when substep **`si`**
+//! misses **`collision_every_n_substeps - 1 mod N`** (**`collision_every_n_substeps = 1`** = unchanged).
+//!
+//! **Stability:** Tune [`SUBSTEPS`] / [`INNER_ITERS`] defaults (`to_sim_config`) or **`ClothSimConfig::solve_*`** overrides; stretch α = 0 with few iterations often looks like edge-length “explosion”.
+//! [`ClothSimUniforms::jacobi_omega`] scales each distance correction; raise [`JACOBI_CORRECTION_CAP`] only if edges are long.
+//!
+//! **Note:** Apple Instruments **Metal GPU** exports (`xctrace export` → `metal_gpu_intervals.xml`) typically show **`(wgpu internal) Pre Pass:Compute Command`** once **per dispatch** inside a pass (`cloth_pass_distance_gauss_seidel` aggregates many such rows). Aggregate time by stacking those rows or by **Replay** totals, not only the few top-level labeled passes.
+//!
+//! **Note:** See **`docs/CLOTH_SIM_STABILITY.md`** for stability history.
 
 use bevy::{
     asset::RenderAssetUsages,
@@ -34,6 +44,7 @@ use bevy::{
 };
 use std::borrow::Cow;
 use std::num::NonZero;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::mesh_prep::ClothMeshData;
@@ -42,7 +53,7 @@ pub const CLOTH_SHADER: &str = "shaders/cloth_sim.wgsl";
 /// XPBD (Müller et al.): use enough substeps so constraint corrections stay well-behaved vs. `dt`.
 /// More substeps shrink substep `dt` → XPBD `α̃ = α/dt²` stays moderate and implicit integration is stabler.
 pub const SUBSTEPS: u32 = 36;
-/// Jacobi converges slower than Gauss–Seidel; extra iterations cut residual edge-length drift on free hems (ω stays low).
+/// Inner XPBD constraint iterations per substep (GS + coloring).
 pub const INNER_ITERS: u32 = 22;
 pub const DT: f32 = 1.0 / 60.0;
 pub const THICKNESS: f32 = 0.04;
@@ -54,7 +65,7 @@ pub const DEFAULT_COLL_SCALE: f32 = 0.38;
 /// The previous fixed factor-per-substep (~0.987) implied ~38% velocity loss **per frame**, far heavier than
 /// typical cloth–air damping and made free motion sag slowly after releases.
 pub const DEFAULT_LINEAR_AIR_DRAG_PER_SEC: f32 = 1.25;
-/// Max length of one Jacobi position delta per inner iteration. Too small vs edge length → constraints never close → drift/explosion.
+/// Max length of one **per-endpoint** distance correction in `gs_edges` (each of i/j). Too small vs edge length → drift/explosion.
 pub const JACOBI_CORRECTION_CAP: f32 = 0.28;
 /// Hard speed clamp after gravity in `predict` (m/s).
 pub const PREDICT_MAX_SPEED: f32 = 12.0;
@@ -62,6 +73,11 @@ pub const PREDICT_MAX_SPEED: f32 = 12.0;
 pub const COLLISION_PAIR_FIXSCALE: i32 = 10_000;
 /// Clamp on accumulated self-collision displacement per particle per substep (`collide_apply`).
 pub const COLLISION_APPLY_CLAMP: f32 = 0.35;
+
+/// Stride between dynamic uniform slots (`min_uniform_buffer_offset_alignment`, 256 on WebGPU).
+pub const GS_BATCH_DYNAMIC_STRIDE: u32 = 256;
+/// `gs_edges` workgroup width (Metal benefits from denser grids on large batches; must match WGSL `@workgroup_size`).
+pub const GS_EDGE_THREADS: u32 = 128;
 
 /// Debug / tooling: pause GPU sim or advance one frame at a time (see example keyboard handler).
 /// Extracted to the render world so [`ClothSimNode`] can skip dispatch.
@@ -85,11 +101,20 @@ impl Default for ClothSimControl {
 /// CPU-side config extracted to the render world.
 #[derive(Resource, Clone, ExtractResource, Reflect)]
 pub struct ClothSimConfig {
+    /// XPBD substeps per rendered frame (`uniforms.dt` is [`DT`] / `solve_substeps`).
+    ///
+    /// More steps → stabler stiff constraints but more GPU dispatches (linear in this field).
+    pub solve_substeps: u32,
+    /// Gauss–Seidel / distance iterations per substep (clears λ, then **`B`** `gs_edges` batches).
+    pub solve_inner_iterations: u32,
+    /// With **`N = collision_every_n_substeps.max(1)`**, run **`clear_atomics` → `collide_pairs` → `collide_apply`**
+    /// only when **`si % N == N - 1`** ( **`N = 1`** = every substep). Skipped entirely when **`coll_scale ≤ 0`** on the extracted uniform.
+    pub collision_every_n_substeps: u32,
     pub num_particles: u32,
     pub num_tris: u32,
     pub num_distance_constraints: u32,
-    pub neighbor_packed: Vec<Vec4>,
-    pub neighbor_offsets: Vec<u32>,
+    pub constraint_batch_offsets: Vec<u32>,
+    pub constraint_batch_count: u32,
     pub constraint_i: Vec<u32>,
     pub constraint_j: Vec<u32>,
     pub constraint_rest_len: Vec<f32>,
@@ -122,6 +147,8 @@ pub struct ClothSimUniforms {
     pub floor_y: f32,
     /// Air-drag coefficient \(k\) [s⁻¹]; **`0`** = none (see [`DEFAULT_LINEAR_AIR_DRAG_PER_SEC`]).
     pub linear_drag_per_sec: f32,
+    /// Legacy field in main uniform (unused); GS batch lives in **`binding(19)`** dynamic uniform slots.
+    pub constraint_batch_idx: u32,
 }
 
 impl Default for ClothSimUniforms {
@@ -132,8 +159,7 @@ impl Default for ClothSimUniforms {
             inv_dt: 1.0 / sdt,
             num_particles: 0,
             num_tris: 0,
-            // Parallel Jacobi + per-iteration λ clear needs modest ω; ~0.75+ often blows up dense cloth in frame 1.
-            jacobi_omega: 0.38,
+            jacobi_omega: 1.0,
             inner_iterations: INNER_ITERS,
             thickness: THICKNESS,
             coll_scale: DEFAULT_COLL_SCALE,
@@ -142,25 +168,30 @@ impl Default for ClothSimUniforms {
             grab_idx: -1,
             grab_active: 0,
             grab_stiffness: 0.45,
-            floor_y: -0.7,
+            floor_y: -2.0,
             linear_drag_per_sec: DEFAULT_LINEAR_AIR_DRAG_PER_SEC,
+            constraint_batch_idx: 0,
         }
     }
 }
 
-/// WGSL `SimParams` in `cloth_sim.wgsl` (`var<uniform>`). Written with [`bytemuck`] so GPU layout
-/// cannot drift from `ClothSimUniforms` (encase) — kept in sync via unit test against `ShaderType::min_size`.
+/// WGSL `SimParams`. Must match WGSL packing in `cloth_sim.wgsl`; written with [`bytemuck`] (not encase).
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ClothSimParamsGpu {
     pub dt: f32,
     pub inv_dt: f32,
+    pub inv_dt_sq: f32,
+    /// Equal to `constraint_offsets.len().saturating_sub(1)`; batch index `b` valid when `b < constraint_batch_count`.
+    pub constraint_batch_count: u32,
     pub num_particles: u32,
     pub num_tris: u32,
     pub jacobi_omega: f32,
     pub inner_iterations: u32,
     pub thickness: f32,
     pub coll_scale: f32,
+    /// Padding before `gravity` so **`[f32; 4]`** is 16-byte aligned (`Pod` forbids implicit padding).
+    pub _pad_before_gravity: [f32; 2],
     pub gravity: [f32; 4],
     pub grab_target: [f32; 4],
     pub grab_idx: i32,
@@ -168,46 +199,54 @@ pub struct ClothSimParamsGpu {
     pub grab_stiffness: f32,
     pub floor_y: f32,
     pub linear_drag_per_sec: f32,
-    /// WGSL uniform struct trailing alignment — zero-filled (`Pod`).
-    pub _explicit_uniform_tail_padding: [u8; 12],
+    pub constraint_batch_idx: u32,
+    pub _uniform_pad_vec2_u: [u32; 2],
+    pub _uniform_pad_vec2_f: [f32; 2],
+    pub _uniform_encase_reserve: [u32; 2],
 }
 
-impl From<&ClothSimUniforms> for ClothSimParamsGpu {
-    fn from(u: &ClothSimUniforms) -> Self {
+impl ClothSimParamsGpu {
+    /// Fills GPU uniform bytes; **`constraint_batch_count`** must match **`constraint_batch_offsets`** (length − 1).
+    pub fn pack(uniforms: &ClothSimUniforms, constraint_batch_count: u32) -> Self {
+        let inv_dt = uniforms.inv_dt;
         Self {
-            dt: u.dt,
-            inv_dt: u.inv_dt,
-            num_particles: u.num_particles,
-            num_tris: u.num_tris,
-            jacobi_omega: u.jacobi_omega,
-            inner_iterations: u.inner_iterations,
-            thickness: u.thickness,
-            coll_scale: u.coll_scale,
-            gravity: u.gravity.to_array(),
-            grab_target: u.grab_target.to_array(),
-            grab_idx: u.grab_idx,
-            grab_active: u.grab_active,
-            grab_stiffness: u.grab_stiffness,
-            floor_y: u.floor_y,
-            linear_drag_per_sec: u.linear_drag_per_sec,
-            _explicit_uniform_tail_padding: [0u8; 12],
+            dt: uniforms.dt,
+            inv_dt,
+            inv_dt_sq: inv_dt * inv_dt,
+            constraint_batch_count,
+            num_particles: uniforms.num_particles,
+            num_tris: uniforms.num_tris,
+            jacobi_omega: uniforms.jacobi_omega,
+            inner_iterations: uniforms.inner_iterations,
+            thickness: uniforms.thickness,
+            coll_scale: uniforms.coll_scale,
+            _pad_before_gravity: [0.0, 0.0],
+            gravity: uniforms.gravity.to_array(),
+            grab_target: uniforms.grab_target.to_array(),
+            grab_idx: uniforms.grab_idx,
+            grab_active: uniforms.grab_active,
+            grab_stiffness: uniforms.grab_stiffness,
+            floor_y: uniforms.floor_y,
+            linear_drag_per_sec: uniforms.linear_drag_per_sec,
+            constraint_batch_idx: uniforms.constraint_batch_idx,
+            _uniform_pad_vec2_u: [0, 0],
+            _uniform_pad_vec2_f: [0.0, 0.0],
+            _uniform_encase_reserve: [0, 0],
         }
     }
 }
 
 #[derive(Resource)]
 pub struct ClothSimBuffers {
-    /// `SimParams` (`var<uniform>`) — bytes from [`ClothSimParamsGpu`], not encase (layout-critical).
+    /// `SimParams` (`var<uniform>`) — bytes from [`ClothSimParamsGpu`].
     pub params_uniform: Buffer,
     pub sim_pos: Buffer,
-    pub jac_a: Buffer,
-    pub jac_b: Buffer,
+    pub jac_state: Buffer,
     pub prev: Buffer,
     pub vel: Buffer,
     pub rest: Buffer,
     pub inv_mass: Buffer,
-    pub neigh_off: Buffer,
-    pub neigh_pack: Buffer,
+    pub constraint_batch_offsets: Buffer,
     pub constraint_i: Buffer,
     pub constraint_j: Buffer,
     pub constraint_rest: Buffer,
@@ -217,17 +256,17 @@ pub struct ClothSimBuffers {
     pub tri: Buffer,
     pub atomic_coll: Buffer,
     pub atomic_norm: Buffer,
+    /// `binding(19)` lut: **`batch_count`** slots × [`GS_BATCH_DYNAMIC_STRIDE`] bytes (batch indices 0…).
+    pub gs_batch_dyn: Buffer,
 }
 
 #[derive(Resource)]
 struct ClothPipeline {
     layout: BindGroupLayoutDescriptor,
-    predict: CachedComputePipelineId,
-    copy_sim_to_jac: CachedComputePipelineId,
+    predict_copy_sim_to_jac: CachedComputePipelineId,
     copy_jac_to_sim: CachedComputePipelineId,
     clear_constraint_lambda: CachedComputePipelineId,
-    jacobi_edges: CachedComputePipelineId,
-    jacobi_gather: CachedComputePipelineId,
+    gs_edges: CachedComputePipelineId,
     post_velocity: CachedComputePipelineId,
     clear_atomics: CachedComputePipelineId,
     collide_pairs: CachedComputePipelineId,
@@ -239,14 +278,7 @@ struct ClothPipeline {
 
 #[derive(Resource)]
 struct ClothBindGroups {
-    /// predict, collide, post, normals: jac_in=A, jac_out=B (arbitrary; predict ignores jac_in)
-    base: BindGroup,
-    /// jacobi: read B, write A
-    jac_b_to_a: BindGroup,
-    /// jacobi: read A, write B
-    jac_a_to_b: BindGroup,
-    /// copy_jac_to_sim: read B -> sim
-    copy_from_b: BindGroup,
+    cloth: BindGroup,
 }
 
 #[derive(Resource, Default, Clone, Copy)]
@@ -259,11 +291,29 @@ enum ClothLoadState {
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
 struct ClothSimLabel;
 
+fn sync_cloth_solve_budget_to_uniforms(
+    cfg: Option<Res<ClothSimConfig>>,
+    mut uniforms: ResMut<ClothSimUniforms>,
+) {
+    let Some(cfg) = cfg else {
+        return;
+    };
+    let s = cfg.solve_substeps.max(1);
+    let i = cfg.solve_inner_iterations.max(1);
+    uniforms.dt = DT / s as f32;
+    uniforms.inv_dt = 1.0 / uniforms.dt;
+    uniforms.inner_iterations = i;
+}
+
 pub struct ClothComputePlugin;
 
 impl Plugin for ClothComputePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ClothSimControl>();
+        app.add_systems(
+            PreUpdate,
+            sync_cloth_solve_budget_to_uniforms.run_if(resource_exists::<ClothSimConfig>),
+        );
         app.add_plugins((
             ExtractResourcePlugin::<ClothSimConfig>::default(),
             ExtractResourcePlugin::<ClothSimUniforms>::default(),
@@ -324,7 +374,8 @@ fn init_cloth_sim(
         usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let initial_params = ClothSimParamsGpu::from(uniforms.as_ref());
+    let initial_params =
+        ClothSimParamsGpu::pack(uniforms.as_ref(), config.constraint_batch_count);
     render_queue.write_buffer(
         &params_uniform,
         0,
@@ -337,14 +388,8 @@ fn init_cloth_sim(
         usage,
         mapped_at_creation: false,
     });
-    let jac_a = render_device.create_buffer(&BufferDescriptor {
-        label: Some("cloth_jac_a"),
-        size: vec4_sz(n),
-        usage,
-        mapped_at_creation: false,
-    });
-    let jac_b = render_device.create_buffer(&BufferDescriptor {
-        label: Some("cloth_jac_b"),
+    let jac_state = render_device.create_buffer(&BufferDescriptor {
+        label: Some("cloth_jac_state"),
         size: vec4_sz(n),
         usage,
         mapped_at_creation: false,
@@ -373,15 +418,10 @@ fn init_cloth_sim(
         usage,
         mapped_at_creation: false,
     });
-    let neigh_off = render_device.create_buffer(&BufferDescriptor {
-        label: Some("cloth_neigh_off"),
-        size: u32_sz(n + 1),
-        usage,
-        mapped_at_creation: false,
-    });
-    let neigh_pack = render_device.create_buffer(&BufferDescriptor {
-        label: Some("cloth_neigh_pack"),
-        size: vec4_sz(config.neighbor_packed.len()),
+    let batch_offs_len = config.constraint_batch_offsets.len().max(2);
+    let constraint_batch_offsets_buf = render_device.create_buffer(&BufferDescriptor {
+        label: Some("cloth_constraint_batch_offsets"),
+        size: u32_sz(batch_offs_len),
         usage,
         mapped_at_creation: false,
     });
@@ -442,11 +482,21 @@ fn init_cloth_sim(
         mapped_at_creation: false,
     });
 
-    render_queue.write_buffer(
-        &neigh_pack,
-        0,
-        bytemuck::cast_slice::<Vec4, u8>(&config.neighbor_packed),
-    );
+    let nb_lut = config.constraint_batch_count.max(1) as usize;
+    let gs_dyn_bytes = (GS_BATCH_DYNAMIC_STRIDE as usize).saturating_mul(nb_lut).max(GS_BATCH_DYNAMIC_STRIDE as usize);
+    let mut gs_dyn_lut = vec![0u8; gs_dyn_bytes];
+    for bat in 0..(config.constraint_batch_count as usize) {
+        let o = bat * GS_BATCH_DYNAMIC_STRIDE as usize;
+        gs_dyn_lut[o..o + 4].copy_from_slice(&(bat as u32).to_le_bytes());
+    }
+    let gs_batch_dyn = render_device.create_buffer(&BufferDescriptor {
+        label: Some("cloth_gs_batch_dyn"),
+        size: gs_dyn_bytes as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    render_queue.write_buffer(&gs_batch_dyn, 0, &gs_dyn_lut);
+
     if ec > 0 {
         render_queue.write_buffer(
             &constraint_i_buf,
@@ -479,10 +529,12 @@ fn init_cloth_sim(
         0,
         &vec![0u8; f32_sz(ec_store) as usize],
     );
+    let mut batch_offs_upload = config.constraint_batch_offsets.clone();
+    batch_offs_upload.resize(batch_offs_len, 0);
     render_queue.write_buffer(
-        &neigh_off,
+        &constraint_batch_offsets_buf,
         0,
-        bytemuck::cast_slice::<u32, u8>(&config.neighbor_offsets),
+        bytemuck::cast_slice::<u32, u8>(&batch_offs_upload),
     );
     render_queue.write_buffer(
         &tri,
@@ -501,7 +553,7 @@ fn init_cloth_sim(
     );
     let ip = bytemuck::cast_slice::<Vec4, u8>(&config.initial_pos);
     render_queue.write_buffer(&sim_pos, 0, ip);
-    render_queue.write_buffer(&jac_a, 0, ip);
+    render_queue.write_buffer(&jac_state, 0, ip);
     render_queue.write_buffer(&prev, 0, ip);
     render_queue.write_buffer(&vel, 0, &vec![0u8; vec4_sz(n) as usize]);
 
@@ -515,11 +567,9 @@ fn init_cloth_sim(
                     NonZero::new(std::mem::size_of::<ClothSimParamsGpu>() as u64),
                 ),
                 storage_buffer_sized(false, None),
-                storage_buffer_read_only_sized(false, None),
                 storage_buffer_sized(false, None),
                 storage_buffer_sized(false, None),
                 storage_buffer_sized(false, None),
-                storage_buffer_read_only_sized(false, None),
                 storage_buffer_read_only_sized(false, None),
                 storage_buffer_read_only_sized(false, None),
                 storage_buffer_read_only_sized(false, None),
@@ -534,6 +584,7 @@ fn init_cloth_sim(
                 storage_buffer_sized(false, None),
                 storage_buffer_sized(false, None),
                 storage_buffer_sized(false, None),
+                uniform_buffer_sized(true, NonZero::new(GS_BATCH_DYNAMIC_STRIDE as u64)),
             ),
         ),
     );
@@ -541,11 +592,12 @@ fn init_cloth_sim(
     let shader = asset_server.load(CLOTH_SHADER);
 
     macro_rules! cp {
-        ($name:expr) => {
+        ($label:literal, $name:literal) => {
             pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+                label: Some(Cow::Borrowed($label)),
                 layout: vec![layout.clone()],
                 shader: shader.clone(),
-                entry_point: Some(Cow::from($name)),
+                entry_point: Some(Cow::Borrowed($name)),
                 ..default()
             })
         };
@@ -553,32 +605,34 @@ fn init_cloth_sim(
 
     commands.insert_resource(ClothPipeline {
         layout: layout.clone(),
-        predict: cp!("predict"),
-        copy_sim_to_jac: cp!("copy_sim_to_jac"),
-        copy_jac_to_sim: cp!("copy_jac_to_sim"),
-        clear_constraint_lambda: cp!("clear_constraint_lambda"),
-        jacobi_edges: cp!("jacobi_edges"),
-        jacobi_gather: cp!("jacobi_gather"),
-        post_velocity: cp!("post_velocity"),
-        clear_atomics: cp!("clear_atomics"),
-        collide_pairs: cp!("collide_pairs"),
-        collide_apply: cp!("collide_apply"),
-        clear_norm_atomics: cp!("clear_norm_atomics"),
-        accumulate_normals: cp!("accumulate_normals"),
-        finalize_normals: cp!("finalize_normals"),
+        predict_copy_sim_to_jac: cp!(
+            "cloth_cs_predict_copy_sim_to_jac",
+            "predict_copy_sim_to_jac"
+        ),
+        copy_jac_to_sim: cp!("cloth_cs_copy_jac_to_sim", "copy_jac_to_sim"),
+        clear_constraint_lambda: cp!(
+            "cloth_cs_clear_constraint_lambda",
+            "clear_constraint_lambda"
+        ),
+        gs_edges: cp!("cloth_cs_gs_edges", "gs_edges"),
+        post_velocity: cp!("cloth_cs_post_velocity", "post_velocity"),
+        clear_atomics: cp!("cloth_cs_clear_atomics", "clear_atomics"),
+        collide_pairs: cp!("cloth_cs_collide_pairs", "collide_pairs"),
+        collide_apply: cp!("cloth_cs_collide_apply", "collide_apply"),
+        clear_norm_atomics: cp!("cloth_cs_clear_norm_atomics", "clear_norm_atomics"),
+        accumulate_normals: cp!("cloth_cs_accumulate_normals", "accumulate_normals"),
+        finalize_normals: cp!("cloth_cs_finalize_normals", "finalize_normals"),
     });
 
     commands.insert_resource(ClothSimBuffers {
         params_uniform,
         sim_pos,
-        jac_a,
-        jac_b,
+        jac_state,
         prev,
         vel,
         rest,
         inv_mass: inv_mass_buf,
-        neigh_off,
-        neigh_pack,
+        constraint_batch_offsets: constraint_batch_offsets_buf,
         constraint_i: constraint_i_buf,
         constraint_j: constraint_j_buf,
         constraint_rest: constraint_rest_buf,
@@ -588,6 +642,7 @@ fn init_cloth_sim(
         tri,
         atomic_coll,
         atomic_norm,
+        gs_batch_dyn,
     });
 }
 
@@ -598,23 +653,21 @@ fn make_bind_group(
     buffers: &ClothSimBuffers,
     gpu_rp: &GpuShaderStorageBuffer,
     gpu_rn: &GpuShaderStorageBuffer,
-    jac_in: &Buffer,
-    jac_out: &Buffer,
 ) -> BindGroup {
+    let gs_dyn_slot =
+        BufferSize::new(GS_BATCH_DYNAMIC_STRIDE as u64).expect("stride must fit BufferSize");
     render_device.create_bind_group(
         None,
         &pipeline_cache.get_bind_group_layout(layout),
         &BindGroupEntries::sequential((
             buffers.params_uniform.as_entire_buffer_binding(),
             buffers.sim_pos.as_entire_binding(),
-            jac_in.as_entire_buffer_binding(),
-            jac_out.as_entire_buffer_binding(),
+            buffers.jac_state.as_entire_binding(),
             buffers.prev.as_entire_binding(),
             buffers.vel.as_entire_binding(),
             buffers.rest.as_entire_binding(),
             buffers.inv_mass.as_entire_binding(),
-            buffers.neigh_off.as_entire_binding(),
-            buffers.neigh_pack.as_entire_binding(),
+            buffers.constraint_batch_offsets.as_entire_binding(),
             buffers.constraint_i.as_entire_binding(),
             buffers.constraint_j.as_entire_binding(),
             buffers.constraint_rest.as_entire_binding(),
@@ -626,6 +679,11 @@ fn make_bind_group(
             gpu_rn.buffer.as_entire_binding(),
             buffers.atomic_coll.as_entire_binding(),
             buffers.atomic_norm.as_entire_binding(),
+            BufferBinding {
+                buffer: buffers.gs_batch_dyn.deref(),
+                offset: 0,
+                size: Some(gs_dyn_slot),
+            },
         )),
     )
 }
@@ -661,60 +719,24 @@ fn prepare_cloth_bind_groups(
         return;
     }
 
-    let gpu_params = ClothSimParamsGpu::from(uniforms.as_ref());
+    let gpu_params =
+        ClothSimParamsGpu::pack(uniforms.as_ref(), config.constraint_batch_count);
     render_queue.write_buffer(
         &buffers.params_uniform,
         0,
         bytemuck::bytes_of(&gpu_params),
     );
 
-    let base = make_bind_group(
+    let cloth_bg = make_bind_group(
         &render_device,
         &pipeline_cache,
         &pipeline.layout,
         &buffers,
         gpu_rp,
         gpu_rn,
-        &buffers.jac_a,
-        &buffers.jac_b,
-    );
-    let jac_b_to_a = make_bind_group(
-        &render_device,
-        &pipeline_cache,
-        &pipeline.layout,
-        &buffers,
-        gpu_rp,
-        gpu_rn,
-        &buffers.jac_b,
-        &buffers.jac_a,
-    );
-    let jac_a_to_b = make_bind_group(
-        &render_device,
-        &pipeline_cache,
-        &pipeline.layout,
-        &buffers,
-        gpu_rp,
-        gpu_rn,
-        &buffers.jac_a,
-        &buffers.jac_b,
-    );
-    let copy_from_b = make_bind_group(
-        &render_device,
-        &pipeline_cache,
-        &pipeline.layout,
-        &buffers,
-        gpu_rp,
-        gpu_rn,
-        &buffers.jac_b,
-        &buffers.jac_a,
     );
 
-    commands.insert_resource(ClothBindGroups {
-        base,
-        jac_b_to_a,
-        jac_a_to_b,
-        copy_from_b,
-    });
+    commands.insert_resource(ClothBindGroups { cloth: cloth_bg });
 }
 
 fn check_cloth_pipeline(
@@ -729,8 +751,8 @@ fn check_cloth_pipeline(
         return;
     }
     for id in [
-        pipeline.predict,
-        pipeline.jacobi_edges,
+        pipeline.predict_copy_sim_to_jac,
+        pipeline.gs_edges,
         pipeline.finalize_normals,
     ] {
         match pipeline_cache.get_compute_pipeline_state(id) {
@@ -779,6 +801,7 @@ impl render_graph::Node for ClothSimNode {
         let pipeline = world.resource::<ClothPipeline>();
         let pipeline_cache = world.resource::<PipelineCache>();
         let config = world.resource::<ClothSimConfig>();
+        let uniforms = world.resource::<ClothSimUniforms>();
 
         let n = config.num_particles;
         let wg64 = (n + 63) / 64;
@@ -788,27 +811,40 @@ impl render_graph::Node for ClothSimNode {
         let wg_pairs = (pairs + 255) / 256;
         let n_constraints = config.num_distance_constraints;
         let wg_constraints = (n_constraints + 63) / 64;
+        let num_batches = config.constraint_batch_count as usize;
+        let substeps = config.solve_substeps.max(1) as usize;
+        let inner_iters = config.solve_inner_iterations.max(1) as usize;
+        let coll_tail_enabled = uniforms.coll_scale > 1e-12;
+        let col_stride = config.collision_every_n_substeps.max(1) as usize;
 
-        let mut pass = render_context
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor::default());
+        const DYN_IDLE: &[u32] = &[0];
+        let encoder = render_context.command_encoder();
 
-        for _ in 0..SUBSTEPS {
-            pass.set_bind_group(0, &bg.base, &[]);
-            pass.set_pipeline(pipeline_cache.get_compute_pipeline(pipeline.predict).unwrap());
-            pass.dispatch_workgroups(wg64, 1, 1);
+        for si in 0..substeps {
+            let run_collision_trio =
+                coll_tail_enabled && (si % col_stride == col_stride.saturating_sub(1));
 
-            pass.set_bind_group(0, &bg.base, &[]);
-            pass.set_pipeline(
-                pipeline_cache
-                    .get_compute_pipeline(pipeline.copy_sim_to_jac)
-                    .unwrap(),
-            );
-            pass.dispatch_workgroups(wg64, 1, 1);
+            {
+                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("cloth_pass_integrate_jac_seed"),
+                    timestamp_writes: None,
+                });
+                pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
+                pass.set_pipeline(
+                    pipeline_cache
+                        .get_compute_pipeline(pipeline.predict_copy_sim_to_jac)
+                        .unwrap(),
+                );
+                pass.dispatch_workgroups(wg64, 1, 1);
+            }
 
-            if n_constraints > 0 {
-                for k in 0..INNER_ITERS {
-                    pass.set_bind_group(0, &bg.base, &[]);
+            if n_constraints > 0 && config.constraint_batch_count > 0 {
+                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("cloth_pass_distance_gauss_seidel"),
+                    timestamp_writes: None,
+                });
+                for _inner_i in 0..inner_iters {
+                    pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
                     pass.set_pipeline(
                         pipeline_cache
                             .get_compute_pipeline(pipeline.clear_constraint_lambda)
@@ -816,93 +852,101 @@ impl render_graph::Node for ClothSimNode {
                     );
                     pass.dispatch_workgroups(wg_constraints, 1, 1);
 
-                    let b = if k % 2 == 0 {
-                        &bg.jac_b_to_a
-                    } else {
-                        &bg.jac_a_to_b
-                    };
-                    pass.set_bind_group(0, b, &[]);
+                    pass.set_pipeline(pipeline_cache.get_compute_pipeline(pipeline.gs_edges).unwrap());
+                    for bat in 0..num_batches {
+                        let start = config.constraint_batch_offsets[bat] as usize;
+                        let end = config.constraint_batch_offsets[bat + 1] as usize;
+                        let span = end.saturating_sub(start);
+                        if span == 0 {
+                            continue;
+                        }
+                        let t = GS_EDGE_THREADS.max(1) as usize;
+                        let wg_batch = ((span + (t - 1)) / t) as u32;
+                        let dyn_off = (bat as u32).saturating_mul(GS_BATCH_DYNAMIC_STRIDE);
+                        pass.set_bind_group(0, &bg.cloth, &[dyn_off]);
+                        pass.dispatch_workgroups(wg_batch, 1, 1);
+                    }
+                }
+            }
+
+            {
+                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("cloth_pass_collision_velocity"),
+                    timestamp_writes: None,
+                });
+                pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
+                pass.set_pipeline(
+                    pipeline_cache
+                        .get_compute_pipeline(pipeline.copy_jac_to_sim)
+                        .unwrap(),
+                );
+                pass.dispatch_workgroups(wg64, 1, 1);
+
+                if run_collision_trio {
+                    pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
                     pass.set_pipeline(
                         pipeline_cache
-                            .get_compute_pipeline(pipeline.jacobi_edges)
+                            .get_compute_pipeline(pipeline.clear_atomics)
                             .unwrap(),
                     );
-                    pass.dispatch_workgroups(wg_constraints, 1, 1);
+                    pass.dispatch_workgroups(wg256, 1, 1);
 
-                    pass.set_bind_group(0, b, &[]);
+                    pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
                     pass.set_pipeline(
                         pipeline_cache
-                            .get_compute_pipeline(pipeline.jacobi_gather)
+                            .get_compute_pipeline(pipeline.collide_pairs)
+                            .unwrap(),
+                    );
+                    pass.dispatch_workgroups(wg_pairs, 1, 1);
+
+                    pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
+                    pass.set_pipeline(
+                        pipeline_cache
+                            .get_compute_pipeline(pipeline.collide_apply)
                             .unwrap(),
                     );
                     pass.dispatch_workgroups(wg64, 1, 1);
                 }
+
+                pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
+                pass.set_pipeline(
+                    pipeline_cache
+                        .get_compute_pipeline(pipeline.post_velocity)
+                        .unwrap(),
+                );
+                pass.dispatch_workgroups(wg64, 1, 1);
             }
+        }
 
-            pass.set_bind_group(0, &bg.copy_from_b, &[]);
+        {
+            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                label: Some("cloth_pass_mesh_normals"),
+                timestamp_writes: None,
+            });
+            pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
             pass.set_pipeline(
                 pipeline_cache
-                    .get_compute_pipeline(pipeline.copy_jac_to_sim)
-                    .unwrap(),
-            );
-            pass.dispatch_workgroups(wg64, 1, 1);
-
-            pass.set_bind_group(0, &bg.base, &[]);
-            pass.set_pipeline(
-                pipeline_cache
-                    .get_compute_pipeline(pipeline.clear_atomics)
+                    .get_compute_pipeline(pipeline.clear_norm_atomics)
                     .unwrap(),
             );
             pass.dispatch_workgroups(wg256, 1, 1);
 
-            pass.set_bind_group(0, &bg.base, &[]);
+            pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
             pass.set_pipeline(
                 pipeline_cache
-                    .get_compute_pipeline(pipeline.collide_pairs)
+                    .get_compute_pipeline(pipeline.accumulate_normals)
                     .unwrap(),
             );
-            pass.dispatch_workgroups(wg_pairs, 1, 1);
+            pass.dispatch_workgroups(wg_tris, 1, 1);
 
-            pass.set_bind_group(0, &bg.base, &[]);
+            pass.set_bind_group(0, &bg.cloth, DYN_IDLE);
             pass.set_pipeline(
                 pipeline_cache
-                    .get_compute_pipeline(pipeline.collide_apply)
-                    .unwrap(),
-            );
-            pass.dispatch_workgroups(wg64, 1, 1);
-
-            pass.set_bind_group(0, &bg.base, &[]);
-            pass.set_pipeline(
-                pipeline_cache
-                    .get_compute_pipeline(pipeline.post_velocity)
+                    .get_compute_pipeline(pipeline.finalize_normals)
                     .unwrap(),
             );
             pass.dispatch_workgroups(wg64, 1, 1);
         }
-
-        pass.set_bind_group(0, &bg.base, &[]);
-        pass.set_pipeline(
-            pipeline_cache
-                .get_compute_pipeline(pipeline.clear_norm_atomics)
-                .unwrap(),
-        );
-        pass.dispatch_workgroups(wg256, 1, 1);
-
-        pass.set_bind_group(0, &bg.base, &[]);
-        pass.set_pipeline(
-            pipeline_cache
-                .get_compute_pipeline(pipeline.accumulate_normals)
-                .unwrap(),
-        );
-        pass.dispatch_workgroups(wg_tris, 1, 1);
-
-        pass.set_bind_group(0, &bg.base, &[]);
-        pass.set_pipeline(
-            pipeline_cache
-                .get_compute_pipeline(pipeline.finalize_normals)
-                .unwrap(),
-        );
-        pass.dispatch_workgroups(wg64, 1, 1);
 
         self.last_ack_step_serial
             .store(ctrl.step_serial, Ordering::Relaxed);
@@ -975,10 +1019,11 @@ mod uniform_layout_tests {
     #[test]
     fn cloth_sim_uniforms_uniform_buffer_compatible() {
         ClothSimUniforms::assert_uniform_compat();
-        assert_eq!(
-            ClothSimUniforms::min_size().get(),
-            std::mem::size_of::<ClothSimParamsGpu>() as u64,
-            "hand-written GPU struct size must match encase/uniform layout"
+        let enc = ClothSimUniforms::min_size().get() as usize;
+        let gpu = std::mem::size_of::<ClothSimParamsGpu>();
+        assert!(
+            gpu >= enc,
+            "GPU uniform struct ({gpu} bytes) must be at least as large as encase ClothSimUniforms ({enc} bytes)",
         );
     }
 }
@@ -988,21 +1033,6 @@ impl ClothMeshData {
         &self,
         buf_assets: &mut Assets<ShaderStorageBuffer>,
     ) -> ClothSimConfig {
-        let n = self.num_particles as usize;
-        let mut packed = Vec::new();
-        for pi in 0..n {
-            let s = self.neighbor_offsets[pi] as usize;
-            let e = self.neighbor_offsets[pi + 1] as usize;
-            for k in s..e {
-                packed.push(Vec4::new(
-                    self.neighbor_other[k] as f32,
-                    self.neighbor_rest_len[k],
-                    self.neighbor_compliance[k],
-                    self.neighbor_constraint_id[k] as f32,
-                ));
-            }
-        }
-
         let initial_pos: Vec<Vec4> = self
             .positions
             .iter()
@@ -1034,13 +1064,16 @@ impl ClothMeshData {
             BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC;
 
         ClothSimConfig {
+            solve_substeps: SUBSTEPS,
+            solve_inner_iterations: INNER_ITERS,
+            collision_every_n_substeps: 1,
             render_positions: buf_assets.add(rp),
             render_normals: buf_assets.add(rn),
             num_particles: self.num_particles,
             num_tris: (self.indices.len() / 3) as u32,
             num_distance_constraints: self.num_distance_constraints,
-            neighbor_packed: packed,
-            neighbor_offsets: self.neighbor_offsets.clone(),
+            constraint_batch_offsets: self.constraint_batch_offsets.clone(),
+            constraint_batch_count: self.constraint_batch_count,
             constraint_i: self.constraint_i.clone(),
             constraint_j: self.constraint_j.clone(),
             constraint_rest_len: self.constraint_rest_len.clone(),

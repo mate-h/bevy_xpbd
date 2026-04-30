@@ -7,28 +7,11 @@ use std::path::Path;
 use bevy::math::{Vec3, Vec4};
 
 use crate::cloth_compute::{
-    ClothSimParamsGpu, ClothSimUniforms, DT, INNER_ITERS, SUBSTEPS,
+    ClothSimParamsGpu, ClothSimUniforms, DT, GS_BATCH_DYNAMIC_STRIDE, GS_EDGE_THREADS, INNER_ITERS,
+    SUBSTEPS,
 };
 use crate::mesh_prep::ClothMeshData;
 use crate::xpbd_cpu::{xpbd_substep_with_self_collision, XpbdCpuTimeStepParams};
-
-fn neighbor_packed(mesh: &ClothMeshData) -> Vec<Vec4> {
-    let n = mesh.num_particles as usize;
-    let mut packed = Vec::new();
-    for pi in 0..n {
-        let s = mesh.neighbor_offsets[pi] as usize;
-        let e = mesh.neighbor_offsets[pi + 1] as usize;
-        for k in s..e {
-            packed.push(Vec4::new(
-                mesh.neighbor_other[k] as f32,
-                mesh.neighbor_rest_len[k],
-                mesh.neighbor_compliance[k],
-                mesh.neighbor_constraint_id[k] as f32,
-            ));
-        }
-    }
-    packed
-}
 
 fn vec4_buf(n: usize) -> u64 {
     (n * 16) as u64
@@ -37,12 +20,10 @@ fn vec4_buf(n: usize) -> u64 {
 struct WgpuClothContext {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    predict: wgpu::ComputePipeline,
-    copy_sim_to_jac: wgpu::ComputePipeline,
+    predict_copy_sim_to_jac: wgpu::ComputePipeline,
     copy_jac_to_sim: wgpu::ComputePipeline,
-    jacobi_edges: wgpu::ComputePipeline,
-    jacobi_gather: wgpu::ComputePipeline,
     clear_constraint_lambda: wgpu::ComputePipeline,
+    gs_edges: wgpu::ComputePipeline,
     post_velocity: wgpu::ComputePipeline,
     clear_atomics: wgpu::ComputePipeline,
     collide_pairs: wgpu::ComputePipeline,
@@ -91,30 +72,38 @@ impl WgpuClothContext {
                     count: None,
                 },
                 storage_entry(1, false),
-                storage_entry(2, true),
+                storage_entry(2, false),
                 storage_entry(3, false),
                 storage_entry(4, false),
-                storage_entry(5, false),
+                storage_entry(5, true),
                 storage_entry(6, true),
                 storage_entry(7, true),
                 storage_entry(8, true),
                 storage_entry(9, true),
                 storage_entry(10, true),
                 storage_entry(11, true),
-                storage_entry(12, true),
-                storage_entry(13, true),
-                storage_entry(14, false),
+                storage_entry(12, false),
+                storage_entry(13, false),
+                storage_entry(14, true),
                 storage_entry(15, false),
-                storage_entry(16, true),
+                storage_entry(16, false),
                 storage_entry(17, false),
                 storage_entry(18, false),
-                storage_entry(19, false),
-                storage_entry(20, false),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 19,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: NonZeroU64::new(GS_BATCH_DYNAMIC_STRIDE as u64),
+                    },
+                    count: None,
+                },
             ],
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("cloth"),
+            label: Some("cloth_pipeline_layout"),
             bind_group_layouts: &[&bind_layout],
             push_constant_ranges: &[],
         });
@@ -122,7 +111,7 @@ impl WgpuClothContext {
         macro_rules! cp {
             ($entry:literal) => {
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some($entry),
+                    label: Some(concat!("cloth_cs_", $entry)),
                     layout: Some(&pipeline_layout),
                     module: &module,
                     entry_point: Some($entry),
@@ -133,12 +122,10 @@ impl WgpuClothContext {
         }
 
         Some(Self {
-            predict: cp!("predict"),
-            copy_sim_to_jac: cp!("copy_sim_to_jac"),
+            predict_copy_sim_to_jac: cp!("predict_copy_sim_to_jac"),
             copy_jac_to_sim: cp!("copy_jac_to_sim"),
             clear_constraint_lambda: cp!("clear_constraint_lambda"),
-            jacobi_edges: cp!("jacobi_edges"),
-            jacobi_gather: cp!("jacobi_gather"),
+            gs_edges: cp!("gs_edges"),
             post_velocity: cp!("post_velocity"),
             clear_atomics: cp!("clear_atomics"),
             collide_pairs: cp!("collide_pairs"),
@@ -166,14 +153,12 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
 struct Buffers {
     params: wgpu::Buffer,
     sim_pos: wgpu::Buffer,
-    jac_a: wgpu::Buffer,
-    jac_b: wgpu::Buffer,
+    jac_state: wgpu::Buffer,
     prev: wgpu::Buffer,
     vel: wgpu::Buffer,
     rest: wgpu::Buffer,
     inv_mass: wgpu::Buffer,
-    neigh_off: wgpu::Buffer,
-    neigh_pack: wgpu::Buffer,
+    constraint_batch_offsets: wgpu::Buffer,
     constraint_i: wgpu::Buffer,
     constraint_j: wgpu::Buffer,
     constraint_rest: wgpu::Buffer,
@@ -185,9 +170,10 @@ struct Buffers {
     render_nrm: wgpu::Buffer,
     atomic_coll: wgpu::Buffer,
     atomic_norm: wgpu::Buffer,
+    gs_batch_dyn: wgpu::Buffer,
 }
 
-fn make_buffers(ctx: &WgpuClothContext, mesh: &ClothMeshData, packed: &[Vec4]) -> Buffers {
+fn make_buffers(ctx: &WgpuClothContext, mesh: &ClothMeshData) -> Buffers {
     let dev = &ctx.device;
     let n = mesh.num_particles as usize;
     let usage =
@@ -217,18 +203,17 @@ fn make_buffers(ctx: &WgpuClothContext, mesh: &ClothMeshData, packed: &[Vec4]) -
         })
     };
 
-    let sim_pos = vb("sim", vec4_buf(n));
-    let jac_a = vb("jac_a", vec4_buf(n));
-    let jac_b = vb("jac_b", vec4_buf(n));
-    let prev = vb("prev", vec4_buf(n));
-    let vel = vb("vel", vec4_buf(n));
-    let rest = vb("rest", vec4_buf(n));
-    let render_pos = vb("rp", vec4_buf(n));
-    let render_nrm = vb("rn", vec4_buf(n));
+    let sim_pos = vb("cloth_sim_pos", vec4_buf(n));
+    let jac_state = vb("cloth_jac_state", vec4_buf(n));
+    let prev = vb("cloth_prev_pos", vec4_buf(n));
+    let vel = vb("cloth_velocity", vec4_buf(n));
+    let rest = vb("cloth_rest_pos", vec4_buf(n));
+    let render_pos = vb("cloth_render_positions", vec4_buf(n));
+    let render_nrm = vb("cloth_render_normals", vec4_buf(n));
 
     let ip = bytemuck::cast_slice::<Vec4, u8>(&initial_pos);
     ctx.queue.write_buffer(&sim_pos, 0, ip);
-    ctx.queue.write_buffer(&jac_a, 0, ip);
+    ctx.queue.write_buffer(&jac_state, 0, ip);
     ctx.queue.write_buffer(&prev, 0, ip);
     ctx.queue.write_buffer(&rest, 0, bytemuck::cast_slice::<Vec4, u8>(&rest_pos));
     ctx.queue
@@ -245,7 +230,7 @@ fn make_buffers(ctx: &WgpuClothContext, mesh: &ClothMeshData, packed: &[Vec4]) -
     );
 
     let inv_mass = dev.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("inv_mass"),
+        label: Some("cloth_inv_mass"),
         size: (n * 4) as u64,
         usage,
         mapped_at_creation: false,
@@ -256,61 +241,56 @@ fn make_buffers(ctx: &WgpuClothContext, mesh: &ClothMeshData, packed: &[Vec4]) -
         bytemuck::cast_slice::<f32, u8>(&mesh.inv_mass),
     );
 
-    let neigh_off = dev.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("neigh_off"),
-        size: ((n + 1) * 4) as u64,
+    let bo_len = mesh.constraint_batch_offsets.len().max(2);
+    let mut batch_offs_upload = mesh.constraint_batch_offsets.clone();
+    batch_offs_upload.resize(bo_len, 0);
+
+    let constraint_batch_offsets = dev.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cloth_constraint_batch_offsets"),
+        size: (bo_len * 4) as u64,
         usage,
         mapped_at_creation: false,
     });
     ctx.queue.write_buffer(
-        &neigh_off,
+        &constraint_batch_offsets,
         0,
-        bytemuck::cast_slice::<u32, u8>(&mesh.neighbor_offsets),
+        bytemuck::cast_slice::<u32, u8>(&batch_offs_upload),
     );
-
-    let neigh_pack = dev.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("neigh_pack"),
-        size: (packed.len() * 16) as u64,
-        usage,
-        mapped_at_creation: false,
-    });
-    ctx.queue
-        .write_buffer(&neigh_pack, 0, bytemuck::cast_slice::<Vec4, u8>(packed));
 
     let ec = mesh.num_distance_constraints as usize;
     let ec_store = ec.max(1);
     let constraint_i = dev.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("constraint_i"),
+        label: Some("cloth_constraint_i"),
         size: (ec_store * 4) as u64,
         usage,
         mapped_at_creation: false,
     });
     let constraint_j = dev.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("constraint_j"),
+        label: Some("cloth_constraint_j"),
         size: (ec_store * 4) as u64,
         usage,
         mapped_at_creation: false,
     });
     let constraint_rest = dev.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("constraint_rest"),
+        label: Some("cloth_constraint_rest"),
         size: (ec_store * 4) as u64,
         usage,
         mapped_at_creation: false,
     });
     let constraint_comp = dev.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("constraint_comp"),
+        label: Some("cloth_constraint_comp"),
         size: (ec_store * 4) as u64,
         usage,
         mapped_at_creation: false,
     });
     let constraint_lambda = dev.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("constraint_lambda"),
+        label: Some("cloth_constraint_lambda"),
         size: (ec_store * 4) as u64,
         usage,
         mapped_at_creation: false,
     });
     let constraint_delta_lambda = dev.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("constraint_delta_lambda"),
+        label: Some("cloth_constraint_delta_lambda"),
         size: (ec_store * 4) as u64,
         usage,
         mapped_at_creation: false,
@@ -349,7 +329,7 @@ fn make_buffers(ctx: &WgpuClothContext, mesh: &ClothMeshData, packed: &[Vec4]) -
     );
 
     let tri = dev.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("tri"),
+        label: Some("cloth_tri_indices"),
         size: (mesh.indices.len() * 4) as u64,
         usage,
         mapped_at_creation: false,
@@ -361,11 +341,27 @@ fn make_buffers(ctx: &WgpuClothContext, mesh: &ClothMeshData, packed: &[Vec4]) -
     );
 
     let n3 = (n * 3 * 4) as u64;
-    let atomic_coll = vb("atom_coll", n3);
-    let atomic_norm = vb("atom_norm", n3);
+    let atomic_coll = vb("cloth_atomic_coll", n3);
+    let atomic_norm = vb("cloth_atomic_norm", n3);
+
+    let nb_lut = mesh.constraint_batch_count.max(1) as usize;
+    let gs_dyn_bytes =
+        GS_BATCH_DYNAMIC_STRIDE as usize * nb_lut;
+    let mut gs_dyn_lut = vec![0u8; gs_dyn_bytes];
+    for bat in 0..(mesh.constraint_batch_count as usize) {
+        let o = bat * GS_BATCH_DYNAMIC_STRIDE as usize;
+        gs_dyn_lut[o..o + 4].copy_from_slice(&(bat as u32).to_le_bytes());
+    }
+    let gs_batch_dyn = dev.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cloth_gs_batch_dyn"),
+        size: gs_dyn_bytes as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    ctx.queue.write_buffer(&gs_batch_dyn, 0, &gs_dyn_lut);
 
     let params = dev.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("params"),
+        label: Some("cloth_sim_params_uniform"),
         size: std::mem::size_of::<ClothSimParamsGpu>() as u64,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
@@ -374,14 +370,12 @@ fn make_buffers(ctx: &WgpuClothContext, mesh: &ClothMeshData, packed: &[Vec4]) -
     Buffers {
         params,
         sim_pos,
-        jac_a,
-        jac_b,
+        jac_state,
         prev,
         vel,
         rest,
         inv_mass,
-        neigh_off,
-        neigh_pack,
+        constraint_batch_offsets,
         constraint_i,
         constraint_j,
         constraint_rest,
@@ -393,15 +387,11 @@ fn make_buffers(ctx: &WgpuClothContext, mesh: &ClothMeshData, packed: &[Vec4]) -
         render_nrm,
         atomic_coll,
         atomic_norm,
+        gs_batch_dyn,
     }
 }
 
-fn make_bind_group(
-    ctx: &WgpuClothContext,
-    b: &Buffers,
-    jac_in: &wgpu::Buffer,
-    jac_out: &wgpu::Buffer,
-) -> wgpu::BindGroup {
+fn make_bind_group(ctx: &WgpuClothContext, b: &Buffers) -> wgpu::BindGroup {
     ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &ctx.bind_layout,
@@ -416,166 +406,169 @@ fn make_bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: jac_in.as_entire_binding(),
+                resource: b.jac_state.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 3,
-                resource: jac_out.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
                 resource: b.prev.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
-                binding: 5,
+                binding: 4,
                 resource: b.vel.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
-                binding: 6,
+                binding: 5,
                 resource: b.rest.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
-                binding: 7,
+                binding: 6,
                 resource: b.inv_mass.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
+                binding: 7,
+                resource: b.constraint_batch_offsets.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
                 binding: 8,
-                resource: b.neigh_off.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 9,
-                resource: b.neigh_pack.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 10,
                 resource: b.constraint_i.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
-                binding: 11,
+                binding: 9,
                 resource: b.constraint_j.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
-                binding: 12,
+                binding: 10,
                 resource: b.constraint_rest.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
-                binding: 13,
+                binding: 11,
                 resource: b.constraint_comp.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
-                binding: 14,
+                binding: 12,
                 resource: b.constraint_lambda.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
-                binding: 15,
+                binding: 13,
                 resource: b.constraint_delta_lambda.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
-                binding: 16,
+                binding: 14,
                 resource: b.tri.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
-                binding: 17,
+                binding: 15,
                 resource: b.render_pos.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
-                binding: 18,
+                binding: 16,
                 resource: b.render_nrm.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
-                binding: 19,
+                binding: 17,
                 resource: b.atomic_coll.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
-                binding: 20,
+                binding: 18,
                 resource: b.atomic_norm.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 19,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &b.gs_batch_dyn,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(GS_BATCH_DYNAMIC_STRIDE.into()),
+                }),
             },
         ],
     })
 }
 
-struct BindTriplet {
-    base: wgpu::BindGroup,
-    jac_b_to_a: wgpu::BindGroup,
-    jac_a_to_b: wgpu::BindGroup,
-    copy_from_b: wgpu::BindGroup,
-}
-
-fn bind_triplet(ctx: &WgpuClothContext, b: &Buffers) -> BindTriplet {
-    BindTriplet {
-        base: make_bind_group(ctx, b, &b.jac_a, &b.jac_b),
-        jac_b_to_a: make_bind_group(ctx, b, &b.jac_b, &b.jac_a),
-        jac_a_to_b: make_bind_group(ctx, b, &b.jac_a, &b.jac_b),
-        copy_from_b: make_bind_group(ctx, b, &b.jac_b, &b.jac_a),
-    }
-}
-
-fn run_one_gpu_substep(ctx: &WgpuClothContext, _b: &Buffers, bg: &BindTriplet, n: u32, num_constraints: u32) {
+fn run_one_gpu_substep(
+    ctx: &WgpuClothContext,
+    _b: &Buffers,
+    bg: &wgpu::BindGroup,
+    mesh: &ClothMeshData,
+    n: u32,
+    num_constraints: u32,
+) {
     let wg64 = ((n as usize) + 63) / 64;
     let wg256 = (n as usize * 3 + 255) / 256;
     let pairs = n as usize * ((n as usize).saturating_sub(1)) / 2;
     let wg_pairs = (pairs + 255) / 256;
     let wg_constraints = (num_constraints as usize + 63) / 64;
+    let num_batches = mesh.constraint_batch_count as usize;
 
-    let mut encoder = ctx
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("cloth_substep"),
-        });
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("cloth_encoder_substep"),
+            });
+    const DYN_IDLE: &[u32] = &[0];
+
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("substep"),
+            label: Some("cloth_pass_integrate_jac_seed"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&ctx.predict);
-        pass.set_bind_group(0, &bg.base, &[]);
+        pass.set_pipeline(&ctx.predict_copy_sim_to_jac);
+        pass.set_bind_group(0, bg, DYN_IDLE);
         pass.dispatch_workgroups(wg64 as u32, 1, 1);
+    }
 
-        pass.set_pipeline(&ctx.copy_sim_to_jac);
-        pass.set_bind_group(0, &bg.base, &[]);
-        pass.dispatch_workgroups(wg64 as u32, 1, 1);
+    if num_constraints > 0 && mesh.constraint_batch_count > 0 {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("cloth_pass_distance_gauss_seidel"),
+            timestamp_writes: None,
+        });
+        for _k in 0..INNER_ITERS {
+            pass.set_pipeline(&ctx.clear_constraint_lambda);
+            pass.set_bind_group(0, bg, DYN_IDLE);
+            pass.dispatch_workgroups(wg_constraints as u32, 1, 1);
 
-        if num_constraints > 0 {
-            for k in 0..INNER_ITERS {
-                pass.set_pipeline(&ctx.clear_constraint_lambda);
-                pass.set_bind_group(0, &bg.base, &[]);
-                pass.dispatch_workgroups(wg_constraints as u32, 1, 1);
-
-                let jac_bg = if k % 2 == 0 {
-                    &bg.jac_b_to_a
-                } else {
-                    &bg.jac_a_to_b
-                };
-                pass.set_pipeline(&ctx.jacobi_edges);
-                pass.set_bind_group(0, jac_bg, &[]);
-                pass.dispatch_workgroups(wg_constraints as u32, 1, 1);
-
-                pass.set_pipeline(&ctx.jacobi_gather);
-                pass.set_bind_group(0, jac_bg, &[]);
-                pass.dispatch_workgroups(wg64 as u32, 1, 1);
+            pass.set_pipeline(&ctx.gs_edges);
+            for bat in 0..num_batches {
+                let start = mesh.constraint_batch_offsets[bat] as usize;
+                let end = mesh.constraint_batch_offsets[bat + 1] as usize;
+                let span = end.saturating_sub(start);
+                if span == 0 {
+                    continue;
+                }
+                let t = GS_EDGE_THREADS.max(1) as usize;
+                let wg_batch = ((span + (t - 1)) / t) as u32;
+                let dyn_off = (bat as u32).saturating_mul(GS_BATCH_DYNAMIC_STRIDE);
+                pass.set_bind_group(0, bg, &[dyn_off]);
+                pass.dispatch_workgroups(wg_batch, 1, 1);
             }
         }
+    }
 
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("cloth_pass_collision_velocity"),
+            timestamp_writes: None,
+        });
         pass.set_pipeline(&ctx.copy_jac_to_sim);
-        pass.set_bind_group(0, &bg.copy_from_b, &[]);
+        pass.set_bind_group(0, bg, DYN_IDLE);
         pass.dispatch_workgroups(wg64 as u32, 1, 1);
 
         pass.set_pipeline(&ctx.clear_atomics);
-        pass.set_bind_group(0, &bg.base, &[]);
+        pass.set_bind_group(0, bg, DYN_IDLE);
         pass.dispatch_workgroups(wg256 as u32, 1, 1);
 
         pass.set_pipeline(&ctx.collide_pairs);
-        pass.set_bind_group(0, &bg.base, &[]);
+        pass.set_bind_group(0, bg, DYN_IDLE);
         pass.dispatch_workgroups(wg_pairs as u32, 1, 1);
 
         pass.set_pipeline(&ctx.collide_apply);
-        pass.set_bind_group(0, &bg.base, &[]);
+        pass.set_bind_group(0, bg, DYN_IDLE);
         pass.dispatch_workgroups(wg64 as u32, 1, 1);
 
         pass.set_pipeline(&ctx.post_velocity);
-        pass.set_bind_group(0, &bg.base, &[]);
+        pass.set_bind_group(0, bg, DYN_IDLE);
         pass.dispatch_workgroups(wg64 as u32, 1, 1);
     }
+
     ctx.queue.submit(std::iter::once(encoder.finish()));
     let _ = ctx.device.poll(wgpu::PollType::Wait {
         submission_index: None,
@@ -586,7 +579,7 @@ fn run_one_gpu_substep(ctx: &WgpuClothContext, _b: &Buffers, bg: &BindTriplet, n
 fn read_vec4_positions(ctx: &WgpuClothContext, buf: &wgpu::Buffer, n: usize) -> Vec<Vec3> {
     let size = vec4_buf(n);
     let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("readback"),
+        label: Some("cloth_buffer_readback"),
         size,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
@@ -594,7 +587,7 @@ fn read_vec4_positions(ctx: &WgpuClothContext, buf: &wgpu::Buffer, n: usize) -> 
     let mut encoder = ctx
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("copy_sim"),
+            label: Some("cloth_encoder_copy_positions"),
         });
     encoder.copy_buffer_to_buffer(buf, 0, &staging, 0, size);
     ctx.queue.submit(std::iter::once(encoder.finish()));
@@ -647,7 +640,6 @@ mod tests {
 
         let mesh = triangle_cloth();
         assert_eq!(mesh.num_particles, 3);
-        let packed = neighbor_packed(&mesh);
         let n = mesh.num_particles;
 
         let sdt = DT / SUBSTEPS as f32;
@@ -665,6 +657,7 @@ mod tests {
             ..Default::default()
         };
         u.inner_iterations = INNER_ITERS;
+        u.constraint_batch_idx = 0;
 
         let sub = XpbdCpuTimeStepParams {
             dt: sdt,
@@ -683,20 +676,15 @@ mod tests {
         let mut sim_cpu = mesh.positions.clone();
         let mut prev = vec![Vec3::ZERO; n as usize];
         let mut vel = vec![Vec3::ZERO; n as usize];
-        let mut jac_a = vec![Vec3::ZERO; n as usize];
-        let mut jac_b = vec![Vec3::ZERO; n as usize];
+        let mut jac_work = vec![Vec3::ZERO; n as usize];
         let rest3 = mesh.rest_positions.clone();
 
         xpbd_substep_with_self_collision(
             &mut sim_cpu,
             &mut prev,
             &mut vel,
-            &mut jac_a,
-            &mut jac_b,
+            &mut jac_work,
             &mesh.inv_mass,
-            &mesh.neighbor_offsets,
-            &mesh.neighbor_other,
-            &mesh.neighbor_constraint_id,
             &mesh.constraint_i,
             &mesh.constraint_j,
             &mesh.constraint_rest_len,
@@ -707,14 +695,14 @@ mod tests {
             &sub,
         );
 
-        let b = make_buffers(&ctx, &mesh, &packed);
+        let b = make_buffers(&ctx, &mesh);
         ctx.queue.write_buffer(
             &b.params,
             0,
-            bytemuck::bytes_of(&ClothSimParamsGpu::from(&u)),
+            bytemuck::bytes_of(&ClothSimParamsGpu::pack(&u, mesh.constraint_batch_count)),
         );
-        let bg = bind_triplet(&ctx, &b);
-        run_one_gpu_substep(&ctx, &b, &bg, n, mesh.num_distance_constraints);
+        let bg = make_bind_group(&ctx, &b);
+        run_one_gpu_substep(&ctx, &b, &bg, &mesh, n, mesh.num_distance_constraints);
         let sim_gpu = read_vec4_positions(&ctx, &b.sim_pos, n as usize);
 
         let eps = 2e-3_f32;
@@ -741,7 +729,6 @@ mod tests {
             .expect("GPU adapter + cloth_sim.wgsl load required for parity test");
 
         let mesh = crate::mesh_prep::grid_cloth_hanging(18, 18, 0.042);
-        let packed = neighbor_packed(&mesh);
         let n = mesh.num_particles;
 
         let sdt = DT / SUBSTEPS as f32;
@@ -753,6 +740,7 @@ mod tests {
         u.inner_iterations = INNER_ITERS;
         u.grab_idx = -1;
         u.grab_active = 0;
+        u.constraint_batch_idx = 0;
 
         let sub = XpbdCpuTimeStepParams {
             dt: sdt,
@@ -771,20 +759,15 @@ mod tests {
         let mut sim_cpu = mesh.positions.clone();
         let mut prev = vec![Vec3::ZERO; n as usize];
         let mut vel = vec![Vec3::ZERO; n as usize];
-        let mut jac_a = vec![Vec3::ZERO; n as usize];
-        let mut jac_b = vec![Vec3::ZERO; n as usize];
+        let mut jac_work = vec![Vec3::ZERO; n as usize];
         let rest3 = mesh.rest_positions.clone();
 
         xpbd_substep_with_self_collision(
             &mut sim_cpu,
             &mut prev,
             &mut vel,
-            &mut jac_a,
-            &mut jac_b,
+            &mut jac_work,
             &mesh.inv_mass,
-            &mesh.neighbor_offsets,
-            &mesh.neighbor_other,
-            &mesh.neighbor_constraint_id,
             &mesh.constraint_i,
             &mesh.constraint_j,
             &mesh.constraint_rest_len,
@@ -795,14 +778,14 @@ mod tests {
             &sub,
         );
 
-        let b = make_buffers(&ctx, &mesh, &packed);
+        let b = make_buffers(&ctx, &mesh);
         ctx.queue.write_buffer(
             &b.params,
             0,
-            bytemuck::bytes_of(&ClothSimParamsGpu::from(&u)),
+            bytemuck::bytes_of(&ClothSimParamsGpu::pack(&u, mesh.constraint_batch_count)),
         );
-        let bg = bind_triplet(&ctx, &b);
-        run_one_gpu_substep(&ctx, &b, &bg, n, mesh.num_distance_constraints);
+        let bg = make_bind_group(&ctx, &b);
+        run_one_gpu_substep(&ctx, &b, &bg, &mesh, n, mesh.num_distance_constraints);
         let sim_gpu = read_vec4_positions(&ctx, &b.sim_pos, n as usize);
 
         let eps = 2.5e-2_f32;

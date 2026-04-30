@@ -1,24 +1,25 @@
 //! Welded OBJ parsing and procedural grid cloth (topology, edges, bending pairs, invMass, pins).
 //!
-//! Neighbor arrays for Jacobi gather must stay cursor-scattered by particle range — see **`docs/CLOTH_SIM_STABILITY.md`**.
+//! Neighbor slices stay cursor-scattered by particle (`neighbor_offsets`): each entry aligns with XPBD λ row indices after **batch‑sorted** constraint order (Gauss–Seidel coloring).
 
 use bevy::math::{Vec2, Vec3};
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
 
 /// Bending constraints (hinge “opposite vertices”): lower α = **stiffer** bend, less edge furling / curl on free boundaries.
 /// Too soft → bottom hem bows inward (curved rest shape) as hinge chains relax under gravity.
 pub const DEFAULT_BEND_COMPLIANCE: f32 = 3.8;
-/// Structural (triangle edge) constraints: tiny α improves Jacobi XPBD conditioning vs `0.0`,
+/// Structural (triangle edge) constraints: tiny α improves XPBD conditioning vs `0.0`,
 /// which with few iterations leaves large length errors and visible blow-ups.
-/// Stiff enough for a hanging sheet; tiny α with Jacobi still fights convergence — don’t go far below ~1e‑8 without more inner iterations.
+/// Stiff enough for a hanging sheet; tiny α still fights convergence — don’t go far below ~1e‑8 without more inner iterations.
 pub const DEFAULT_STRETCH_COMPLIANCE: f32 = 2e-8;
 /// Skip‑2 braces on regular grids (`grid_cloth_hanging` + detected OBJ grids): every-other links along rows/cols.
 /// Match triangle-edge stiffness order (`≈` [`DEFAULT_STRETCH_COMPLIANCE`]): much softer skip‑2 lets the bottom chain **compress
-/// in X** under Jacobi (span looks “shortened”) while curling out of plane.
+/// in X** (span looks “shortened”) while curling out of plane.
 pub const DEFAULT_SKIP2_COMPLIANCE: f32 = 2.5e-8;
 /// Cross diagonal **not** represented as a triangle edge after quad tessellation (locks in-plane shear).
 /// OBJ fan `(v0,v1,v2)+(v0,v2,v3)` leaves **v1–v3** unstretched; procedural grid `(i0,i1,i2)+(i1,i3,i2)` leaves **i0–i3**.
-/// **Stiffer** than [`DEFAULT_STRETCH_COMPLIANCE`] so shear converges faster under Jacobi (smaller residual ±Z early on).
+/// **Stiffer** than [`DEFAULT_STRETCH_COMPLIANCE`] so shear converges faster (smaller residual ±Z early on).
 pub const DEFAULT_CROSS_DIAG_COMPLIANCE: f32 = 6e-9;
 
 #[derive(Clone, Debug)]
@@ -45,6 +46,10 @@ pub struct ClothMeshData {
     pub num_particles: u32,
     pub num_distance_constraints: u32,
     pub rest_positions: Vec<Vec3>,
+    /// Starts of contiguous constraint spans per GPU color batch; length = `constraint_batch_count + 1`; last element = number of constraints.
+    pub constraint_batch_offsets: Vec<u32>,
+    /// Number of color batches (= `constraint_batch_offsets.len().saturating_sub(1)`).
+    pub constraint_batch_count: u32,
 }
 
 fn vec3_from_f32x3(a: [f32; 3]) -> Vec3 {
@@ -65,6 +70,84 @@ fn len3(v: Vec3) -> f32 {
 
 fn dist(a: Vec3, b: Vec3) -> f32 {
     (a - b).length()
+}
+
+/// Greedy edge coloring so no two constraints sharing a particle share a batch; edges are processed
+/// in **descending max-endpoint degree** order (DSATUR-style heuristic) to reduce the color count;
+/// results are sorted by `(color, index)` into contiguous batches for GPU parallel Gauss–Seidel.
+fn partition_constraints_for_gs_batches(
+    n_particles: usize,
+    constraints: Vec<(u32, u32, f32, f32)>,
+) -> (
+    Vec<(u32, u32, f32, f32)>,
+    Vec<u32>,
+    u32,
+) {
+    let e_count = constraints.len();
+    if e_count == 0 {
+        return (constraints, vec![0, 0], 0);
+    }
+
+    let mut deg = vec![0u32; n_particles];
+    for &(i, j, _, _) in &constraints {
+        deg[i as usize] += 1;
+        deg[j as usize] += 1;
+    }
+
+    // Color high-connectivity vertices first → fewer hues (smaller Δ+1 colouring) vs arbitrary insertion order → fewer batches / dispatches per inner XPBD iteration.
+    let mut process_order: Vec<usize> = (0..e_count).collect();
+    process_order.sort_by_key(|&e| {
+        let (i, j, _, _) = constraints[e];
+        let d = deg[i as usize].max(deg[j as usize]);
+        (Reverse(d), i.min(j), i.max(j))
+    });
+
+    let mut color_of_edge = vec![0u32; e_count];
+    let mut occupied: Vec<Vec<u32>> = vec![Vec::new(); n_particles];
+    let mut forb = HashSet::new();
+
+    for &e in &process_order {
+        let i = constraints[e].0 as usize;
+        let j = constraints[e].1 as usize;
+        debug_assert!(i < n_particles && j < n_particles);
+
+        forb.clear();
+        for &c in &occupied[i] {
+            forb.insert(c);
+        }
+        for &c in &occupied[j] {
+            forb.insert(c);
+        }
+        let mut c = 0u32;
+        while forb.contains(&c) {
+            c += 1;
+        }
+        color_of_edge[e] = c;
+        occupied[i].push(c);
+        occupied[j].push(c);
+    }
+
+    let mut order: Vec<usize> = (0..e_count).collect();
+    order.sort_by_key(|&ei| (color_of_edge[ei], ei));
+
+    let sorted_constraints: Vec<_> = order.iter().map(|&ei| constraints[ei]).collect();
+    let sorted_colors: Vec<u32> = order.iter().map(|&ei| color_of_edge[ei]).collect();
+
+    let mut offs = vec![0u32];
+    for k in 1..e_count {
+        if sorted_colors[k] != sorted_colors[k - 1] {
+            offs.push(k as u32);
+        }
+    }
+    offs.push(e_count as u32);
+
+    let batch_count = (offs.len().saturating_sub(1)) as u32;
+
+    (
+        sorted_constraints,
+        offs,
+        batch_count,
+    )
 }
 
 pub fn parse_welded_obj(obj_text: &str) -> ClothMeshData {
@@ -434,6 +517,9 @@ fn finalize_cloth_mesh(
         constraints.push((i, j, rest, DEFAULT_BEND_COMPLIANCE));
     }
     constraints.extend_from_slice(extra_constraints);
+
+    let (constraints, constraint_batch_offsets, constraint_batch_count) =
+        partition_constraints_for_gs_batches(n, constraints);
     let num_distance_constraints = constraints.len() as u32;
 
     let mut neighbor_offsets: Vec<u32> = vec![0; n + 1];
@@ -458,8 +544,7 @@ fn finalize_cloth_mesh(
     let mut neighbor_compliance: Vec<f32> = vec![0.0; nn];
     let mut neighbor_constraint_id: Vec<u32> = vec![0; nn];
 
-    // Scatter into per-particle contiguous ranges — `push()` in constraint order would leave
-    // `neighbor_offsets` pointing at unrelated edges and blow up Jacobi gather (+ GPU `neighbor_packed`).
+    // Scatter into per-particle contiguous ranges — cursor order must track batch-sorted `constraint_*` rows.
     let mut cursors = neighbor_offsets[..n].to_vec();
     for (eid, &(i, j, rest, comp)) in constraints.iter().enumerate() {
         let eid = eid as u32;
@@ -505,6 +590,8 @@ fn finalize_cloth_mesh(
         num_particles: n as u32,
         num_distance_constraints,
         rest_positions,
+        constraint_batch_offsets,
+        constraint_batch_count,
     }
 }
 
