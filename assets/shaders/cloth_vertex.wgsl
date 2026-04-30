@@ -94,7 +94,13 @@ fn vertex(vertex: Vertex, @builtin(vertex_index) vertex_index: u32) -> VertexOut
 @fragment
 fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
     var pbr_input = pbr_input_from_standard_material(in, is_front);
-    pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
+    // `StandardMaterial.double_sided` + `cull_mode: None` in Rust; back-face albedo below.
+    var alb = pbr_input.material.base_color;
+    if !is_front {
+        // Linear-ish red complement to the demo’s blue front (`examples/cloth_xpbd.rs`).
+        alb = vec4<f32>(0.9, 0.06, 0.055, alb.a);
+    }
+    pbr_input.material.base_color = alpha_discard(pbr_input.material, alb);
 
 #ifdef PREPASS_PIPELINE
     return deferred_output(in, pbr_input);

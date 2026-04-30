@@ -80,6 +80,7 @@ pub const GS_BATCH_DYNAMIC_STRIDE: u32 = 256;
 pub const GS_EDGE_THREADS: u32 = 128;
 
 /// Debug / tooling: pause GPU sim or advance one frame at a time (see example keyboard handler).
+/// Starts **running** (`sim_paused = false`); pause with **`P`** in the cloth example if needed.
 /// Extracted to the render world so [`ClothSimNode`] can skip dispatch.
 #[derive(Resource, Clone, ExtractResource, Reflect)]
 pub struct ClothSimControl {
@@ -92,7 +93,7 @@ pub struct ClothSimControl {
 impl Default for ClothSimControl {
     fn default() -> Self {
         Self {
-            sim_paused: true,
+            sim_paused: false,
             step_serial: 0,
         }
     }

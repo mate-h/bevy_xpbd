@@ -1,9 +1,7 @@
 //! XPBD cloth example: GPU simulation + extended PBR + mouse grab.
 //!
-//! Loads welded `assets/cloth.obj` (crate root) via `bevy_xpbd::mesh_prep::parse_welded_obj`.
-//! If the file is missing or empty, falls back to a procedural grid.
-
-use std::path::PathBuf;
+//! Procedural rectangular sheet from [`bevy_xpbd::mesh_prep::grid_cloth_hanging`] (high resolution,
+//! pinned top row).
 
 use bevy::{color::LinearRgba, input::keyboard::KeyCode, input::mouse::MouseButton, pbr::ExtendedMaterial, prelude::*};
 use bevy::pbr::StandardMaterial;
@@ -14,47 +12,17 @@ use bevy_xpbd::{
         THICKNESS,
     },
     cloth_material::{ClothMaterialPlugin, ClothMatExt},
-    mesh_prep::{grid_cloth_hanging, parse_welded_obj, ClothMeshData},
+    mesh_prep::{grid_cloth_hanging, ClothMeshData},
 };
 
-/// Relative to the crate root (`CARGO_MANIFEST_DIR`).
-const CLOTH_OBJ_PATH: &str = "assets/cloth.obj";
+/// Quad resolution (was 24×18 at 0.045 m cells ≈ 1.08 × 0.81 m sheet). Aspect matches 24:18.
+const CLOTH_QUAD_COLS: u32 = 128/2;
+const CLOTH_QUAD_ROWS: u32 = 96/2;
+/// Matches prior world size: `(24 × 0.045) / 128` — tweak `CLOTH_QUAD_*` freely with this formula.
+const CLOTH_CELL_SIZE: f32 = (24.0 * 0.045 * 2.0) / CLOTH_QUAD_COLS as f32;
 
-/// Procedural fallback — if sim jitters or stretches, restore defaults via `solve_substeps: 36`,
-/// `solve_inner_iterations: 22` (`bevy_xpbd::cloth_compute`) or widen `cell_size` / simpler mesh.
-const CLOTH_QUAD_COLS: u32 = 24;
-const CLOTH_QUAD_ROWS: u32 = 18;
-const CLOTH_CELL_SIZE: f32 = 0.045;
-
-fn load_cloth_mesh() -> ClothMeshData {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(CLOTH_OBJ_PATH);
-    match std::fs::read_to_string(&path) {
-        Ok(text) => {
-            let data = parse_welded_obj(&text);
-            if data.num_particles == 0 {
-                warn!(
-                    "{} parsed to zero particles; using procedural grid",
-                    path.display()
-                );
-                grid_cloth_hanging(CLOTH_QUAD_COLS, CLOTH_QUAD_ROWS, CLOTH_CELL_SIZE)
-            } else {
-                info!(
-                    "Loaded cloth from {} ({} particles, {} tris)",
-                    path.display(),
-                    data.num_particles,
-                    data.indices.len() / 3
-                );
-                data
-            }
-        }
-        Err(e) => {
-            warn!(
-                "Could not read {}: {e}; using procedural grid",
-                path.display()
-            );
-            grid_cloth_hanging(CLOTH_QUAD_COLS, CLOTH_QUAD_ROWS, CLOTH_CELL_SIZE)
-        }
-    }
+fn procedural_cloth() -> ClothMeshData {
+    grid_cloth_hanging(CLOTH_QUAD_COLS, CLOTH_QUAD_ROWS, CLOTH_CELL_SIZE)
 }
 
 #[derive(Resource, Default)]
@@ -74,7 +42,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "Bevy XPBD cloth — P pause  N step  (sim starts paused)".into(),
+                title: "Bevy XPBD cloth".into(),
                 ..default()
             }),
             ..default()
@@ -94,7 +62,7 @@ fn setup(
     mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
     mut uniforms: ResMut<ClothSimUniforms>,
 ) {
-    let cloth = load_cloth_mesh();
+    let cloth = procedural_cloth();
     let config = cloth.to_sim_config(&mut *buffers);
 
     {
@@ -106,9 +74,9 @@ fn setup(
     }
 
     commands.insert_resource(ClothSimConfig {
-        // ~40% fewer total dispatches vs (36×22) at typical `B`; raise both if seams stretch.
-        solve_substeps: 24,
-        solve_inner_iterations: 14,
+        // Higher particle count (~12k vs ~475) benefits from somewhat more solver work than the prior demo tuning.
+        solve_substeps: 32,
+        solve_inner_iterations: 18,
         // Halves pairwise self-collision work when `coll_scale > 0` (runs on odd-indexed substeps).
         collision_every_n_substeps: 2,
         render_positions: config.render_positions.clone(),
@@ -124,7 +92,10 @@ fn setup(
     let mat = materials.add(ExtendedMaterial {
         base: StandardMaterial {
             base_color: LinearRgba::new(0.08, 0.28, 0.92, 1.0).into(),
+            // `double_sided` only flips normals in the shader; back faces still need `cull_mode: None`
+            // so the rasterizer draws them at all (`StandardMaterial` defaults to back-face culling).
             double_sided: true,
+            cull_mode: None,
             ..default()
         },
         extension: ClothMatExt {
@@ -136,7 +107,7 @@ fn setup(
     commands.spawn((
         Mesh3d(meshes.add(mesh)),
         MeshMaterial3d(mat),
-        Transform::from_xyz(0.0, 0.35, 0.0).with_scale(Vec3::splat(1.0)),
+        Transform::from_xyz(0.0, -0.65, 0.0).with_scale(Vec3::splat(1.0)),
     ));
 
     commands.spawn((
