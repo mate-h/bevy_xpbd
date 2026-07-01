@@ -3,20 +3,28 @@
 //! Default build uses **parallel Jacobi** (`solver-jacobi`). For **colored Gauss–Seidel**:
 //! `cargo run --example cloth_xpbd --no-default-features --features solver-gauss-seidel`.
 
+#[path = "cloth/cloth_ui.rs"]
+mod cloth_ui;
+
 use bevy::pbr::StandardMaterial;
 use bevy::render::storage::ShaderBuffer;
 use bevy::{
     color::LinearRgba, input::keyboard::KeyCode, input::mouse::MouseButton, pbr::ExtendedMaterial,
     prelude::*,
 };
+use bevy_egui::input::{egui_wants_any_keyboard_input, EguiWantsInput};
 use bevy_xpbd::{
     cloth_compute::{
-        ClothComputePlugin, ClothSimConfig, ClothSimControl, ClothSimUniforms, DEFAULT_COLL_SCALE,
-        THICKNESS,
+        ClothComputePlugin, ClothSimConfig, ClothSimControl, ClothSimFrameTiming, ClothSimUniforms,
+        DEFAULT_COLL_SCALE, THICKNESS,
     },
     cloth_material::{ClothMatExt, ClothMaterialPlugin},
     mesh_prep::{grid_cloth_hanging, ClothMeshData},
 };
+use cloth_ui::ClothUiPlugin;
+
+/// Low-pass blend for wall-clock frame Δt (`ClothSimFrameTiming::blend_alpha`).
+const FRAME_DELTA_BLEND_ALPHA: f32 = 0.05;
 
 /// Quad resolution (was 24×18 at 0.045 m cells ≈ 1.08 × 0.81 m sheet). Aspect matches 24:18.
 const CLOTH_QUAD_COLS: u32 = 128;
@@ -51,11 +59,18 @@ fn main() {
             }),
             ..default()
         }))
-        .add_plugins((ClothMaterialPlugin, ClothComputePlugin))
+        .add_plugins((ClothMaterialPlugin, ClothComputePlugin, ClothUiPlugin))
         .insert_resource(ClothSimUniforms::default())
         .insert_resource(GrabState::default())
         .add_systems(Startup, setup)
-        .add_systems(Update, (mouse_grab, cloth_sim_debug_keys))
+        .add_systems(
+            Update,
+            (
+                on_cloth_reinit,
+                mouse_grab,
+                cloth_sim_debug_keys.run_if(not(egui_wants_any_keyboard_input)),
+            ),
+        )
         .run();
 }
 
@@ -65,7 +80,10 @@ fn setup(
     mut materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, ClothMatExt>>>,
     mut buffers: ResMut<Assets<ShaderBuffer>>,
     mut uniforms: ResMut<ClothSimUniforms>,
+    mut timing: ResMut<ClothSimFrameTiming>,
 ) {
+    timing.blend_alpha = FRAME_DELTA_BLEND_ALPHA;
+
     let cloth = procedural_cloth();
     let config = cloth.to_sim_config(&mut *buffers);
 
@@ -133,6 +151,22 @@ fn setup(
     ));
 }
 
+fn on_cloth_reinit(
+    ctrl: Res<ClothSimControl>,
+    mut last_reinit: Local<u64>,
+    mut grab: ResMut<GrabState>,
+    mut uniforms: ResMut<ClothSimUniforms>,
+) {
+    if ctrl.reinit_serial == *last_reinit {
+        return;
+    }
+    *last_reinit = ctrl.reinit_serial;
+    if ctrl.reinit_serial == 0 {
+        return;
+    }
+    release_grab(&mut grab, &mut uniforms);
+}
+
 fn cloth_sim_debug_keys(mut ctrl: ResMut<ClothSimControl>, keys: Res<ButtonInput<KeyCode>>) {
     if keys.just_pressed(KeyCode::KeyP) {
         ctrl.sim_paused = !ctrl.sim_paused;
@@ -142,7 +176,15 @@ fn cloth_sim_debug_keys(mut ctrl: ResMut<ClothSimControl>, keys: Res<ButtonInput
     }
 }
 
+fn release_grab(grab: &mut GrabState, uniforms: &mut ClothSimUniforms) {
+    grab.active = false;
+    grab.particle = -1;
+    uniforms.grab_idx = -1;
+    uniforms.grab_active = 0;
+}
+
 fn mouse_grab(
+    egui_wants: Res<EguiWantsInput>,
     buttons: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     camera_q: Query<(&Camera, &GlobalTransform)>,
@@ -151,6 +193,13 @@ fn mouse_grab(
     mut grab: ResMut<GrabState>,
     mut uniforms: ResMut<ClothSimUniforms>,
 ) {
+    if egui_wants.wants_any_pointer_input() {
+        if grab.active {
+            release_grab(&mut grab, &mut uniforms);
+        }
+        return;
+    }
+
     let Ok(win) = windows.single() else {
         return;
     };
@@ -185,10 +234,7 @@ fn mouse_grab(
     }
 
     if buttons.just_released(MouseButton::Left) {
-        grab.active = false;
-        grab.particle = -1;
-        uniforms.grab_idx = -1;
-        uniforms.grab_active = 0;
+        release_grab(&mut grab, &mut uniforms);
     }
 
     if grab.active {

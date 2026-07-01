@@ -16,7 +16,7 @@ struct SimParams {
     grab_idx: i32,
     grab_active: u32,
     grab_stiffness: f32,
-    floor_y: f32,
+    _pad_legacy_floor: f32,
     linear_drag_per_sec: f32,
     // Unused (legacy layout); real batch index is binding(19) dynamic uniform `gs_dyn_batch`.
     constraint_batch_idx: u32,
@@ -107,9 +107,6 @@ fn xpbd_predict_then_write_jac_row(i: u32) {
     }
     prev_pos[i] = sim_pos[i];
     var p = sim_pos[i].xyz + v * params.dt;
-    if (p.y < params.floor_y) {
-        p.y = params.floor_y;
-    }
     if (params.grab_active != 0u && i32(i) == params.grab_idx) {
         var pull = (params.grab_target.xyz - p) * params.grab_stiffness;
         let pl = length(pull);
@@ -123,7 +120,7 @@ fn xpbd_predict_then_write_jac_row(i: u32) {
     jac_state[i] = sim_pos[i];
 }
 
-/// Gravity / floor / grab integration, then copy **`sim_pos` → `jac_state`** so GS reads fresh positions in one barrier.
+/// Gravity / grab integration, then copy **`sim_pos` → `jac_state`** so GS reads fresh positions in one barrier.
 @compute @workgroup_size(64, 1, 1)
 fn predict_copy_sim_to_jac(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;

@@ -8,8 +8,8 @@ description = "GPU XPBD cloth with Bevy 0.19 (wgpu/WebGPU)"
 path = "src/lib.rs"
 
 [[example]]
-name = "cloth_xpbd"
-path = "examples/cloth_xpbd.rs"
+name = "cloth"
+path = "examples/cloth.rs"
 
 [features]
 default = ["solver-jacobi"]
@@ -21,6 +21,7 @@ bevy = "0.19.0"
 bytemuck = { version = "1.22", features = ["derive"] }
 
 [dev-dependencies]
+bevy_egui = "0.41"
 pollster = "0.4"
 wgpu = "29.0.3"
 

@@ -103,6 +103,8 @@ pub struct ClothSimControl {
     pub sim_paused: bool,
     /// Press "step" (example: N) to increment; each new value runs exactly one sim pass while paused.
     pub step_serial: u64,
+    /// Increment to reset GPU particle state to [`ClothSimConfig::initial_pos`] / [`ClothSimConfig::initial_normals`].
+    pub reinit_serial: u64,
 }
 
 impl Default for ClothSimControl {
@@ -110,6 +112,7 @@ impl Default for ClothSimControl {
         Self {
             sim_paused: false,
             step_serial: 0,
+            reinit_serial: 0,
         }
     }
 }
@@ -166,6 +169,7 @@ pub struct ClothSimConfig {
     pub inv_mass: Vec<f32>,
     pub rest_pos: Vec<Vec4>,
     pub initial_pos: Vec<Vec4>,
+    pub initial_normals: Vec<Vec4>,
     pub render_positions: Handle<ShaderBuffer>,
     pub render_normals: Handle<ShaderBuffer>,
     #[cfg(feature = "solver-jacobi")]
@@ -191,7 +195,6 @@ pub struct ClothSimUniforms {
     pub grab_idx: i32,
     pub grab_active: u32,
     pub grab_stiffness: f32,
-    pub floor_y: f32,
     /// Air-drag coefficient \(k\) [s⁻¹]; **`0`** = none (see [`DEFAULT_LINEAR_AIR_DRAG_PER_SEC`]).
     pub linear_drag_per_sec: f32,
     /// Legacy field in main uniform (unused); GS batch lives in **`binding(19)`** dynamic uniform slots.
@@ -233,7 +236,6 @@ impl Default for ClothSimUniforms {
                     0.45
                 }
             },
-            floor_y: -2.0,
             linear_drag_per_sec: DEFAULT_LINEAR_AIR_DRAG_PER_SEC,
             constraint_batch_idx: 0,
         }
@@ -262,7 +264,7 @@ pub struct ClothSimParamsGpu {
     pub grab_idx: i32,
     pub grab_active: u32,
     pub grab_stiffness: f32,
-    pub floor_y: f32,
+    pub _pad_legacy_floor: f32,
     pub linear_drag_per_sec: f32,
     pub constraint_batch_idx: u32,
     pub _uniform_pad_vec2_u: [u32; 2],
@@ -334,7 +336,7 @@ impl ClothSimParamsGpu {
             grab_idx: uniforms.grab_idx,
             grab_active: uniforms.grab_active,
             grab_stiffness: uniforms.grab_stiffness,
-            floor_y: uniforms.floor_y,
+            _pad_legacy_floor: 0.0,
             linear_drag_per_sec: uniforms.linear_drag_per_sec,
             constraint_batch_idx: uniforms.constraint_batch_idx,
             _uniform_pad_vec2_u: [0, 0],
@@ -461,9 +463,103 @@ impl Plugin for ClothComputePlugin {
             .add_systems(Render, check_cloth_pipeline.in_set(RenderSystems::Prepare))
             .add_systems(
                 Render,
+                apply_cloth_sim_reinit.in_set(RenderSystems::Prepare),
+            )
+            .add_systems(
+                Render,
                 prepare_cloth_bind_groups.in_set(RenderSystems::PrepareBindGroups),
             )
             .add_systems(RenderGraph, run_cloth_sim.before(camera_driver));
+    }
+}
+
+/// Restores GPU sim buffers to the mesh rest pose (positions, zero velocity, cleared λ).
+#[cfg(feature = "solver-gauss-seidel")]
+pub fn reset_cloth_sim_state_gauss_seidel(
+    render_queue: &RenderQueue,
+    config: &ClothSimConfig,
+    buffers: &ClothSimBuffers,
+    render_pos: &Buffer,
+    render_nrm: &Buffer,
+) {
+    let n = config.num_particles as usize;
+    let ec = config.num_distance_constraints as usize;
+    let vec4_bytes = n * 16;
+    let f32_bytes = ec * 4;
+    let ip = bytemuck::cast_slice::<Vec4, u8>(&config.initial_pos);
+    render_queue.write_buffer(&buffers.sim_pos, 0, ip);
+    render_queue.write_buffer(&buffers.jac_state, 0, ip);
+    render_queue.write_buffer(&buffers.prev, 0, ip);
+    render_queue.write_buffer(&buffers.vel, 0, &vec![0u8; vec4_bytes]);
+    render_queue.write_buffer(&buffers.constraint_lambda, 0, &vec![0u8; f32_bytes]);
+    render_queue.write_buffer(&buffers.constraint_delta_lambda, 0, &vec![0u8; f32_bytes]);
+    render_queue.write_buffer(render_pos, 0, ip);
+    render_queue.write_buffer(
+        render_nrm,
+        0,
+        bytemuck::cast_slice::<Vec4, u8>(&config.initial_normals),
+    );
+}
+
+fn apply_cloth_sim_reinit(
+    mut last_reinit_serial: Local<u64>,
+    ctrl: Res<ClothSimControl>,
+    load_state: Res<ClothLoadState>,
+    config: Option<Res<ClothSimConfig>>,
+    render_queue: Res<RenderQueue>,
+    gpu_sb: Res<RenderAssets<GpuShaderBuffer>>,
+    #[cfg(feature = "solver-gauss-seidel")] buffers: Option<Res<ClothSimBuffers>>,
+    #[cfg(feature = "solver-jacobi")] buffers_j: Option<
+        Res<crate::cloth_jacobi::ClothSimBuffersJacobi>,
+    >,
+) {
+    if ctrl.reinit_serial == *last_reinit_serial {
+        return;
+    }
+    *last_reinit_serial = ctrl.reinit_serial;
+    if !matches!(*load_state, ClothLoadState::Ready) {
+        return;
+    }
+    let Some(config) = config else {
+        return;
+    };
+    if config.num_particles == 0 {
+        return;
+    }
+    let Some(gpu_rp) = gpu_sb.get(config.render_positions.id()) else {
+        return;
+    };
+    let Some(gpu_rn) = gpu_sb.get(config.render_normals.id()) else {
+        return;
+    };
+
+    #[cfg(feature = "solver-jacobi")]
+    {
+        let Some(buffers) = buffers_j else {
+            return;
+        };
+        crate::cloth_jacobi::reset_cloth_sim_state_jacobi(
+            &render_queue,
+            &config,
+            &buffers,
+            &gpu_rp.buffer,
+            &gpu_rn.buffer,
+        );
+        return;
+    }
+
+    #[cfg(feature = "solver-gauss-seidel")]
+    {
+        let Some(buffers) = buffers else {
+            return;
+        };
+        reset_cloth_sim_state_gauss_seidel(
+            &render_queue,
+            &config,
+            &buffers,
+            &gpu_rp.buffer,
+            &gpu_rn.buffer,
+        );
     }
 }
 
@@ -1595,6 +1691,7 @@ fn build_sim_config_core(
         inv_mass: mesh.inv_mass.clone(),
         rest_pos,
         initial_pos,
+        initial_normals: initial_nrm,
         #[cfg(feature = "solver-jacobi")]
         neighbor_offsets: Vec::new(),
         #[cfg(feature = "solver-jacobi")]

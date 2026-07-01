@@ -15,7 +15,7 @@ struct SimParams {
     grab_idx: i32,
     grab_active: u32,
     grab_stiffness: f32,
-    floor_y: f32,
+    _pad_legacy_floor: f32,
     linear_drag_per_sec: f32,
     constraint_batch_idx: u32,
     _uniform_pad_vec2_u: vec2<u32>,
@@ -98,9 +98,6 @@ fn xpbd_predict_then_write_jac_out_row(i: u32) {
     }
     prev_pos[i] = sim_pos[i];
     var p = sim_pos[i].xyz + v * params.dt;
-    if (p.y < params.floor_y) {
-        p.y = params.floor_y;
-    }
     if (params.grab_active != 0u && i32(i) == params.grab_idx) {
         var pull = (params.grab_target.xyz - p) * params.grab_stiffness;
         let pl = length(pull);

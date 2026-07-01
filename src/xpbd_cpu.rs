@@ -17,7 +17,6 @@ pub struct XpbdCpuTimeStepParams {
     pub inner_iterations: u32,
     /// Gravity in `predict` (`v += gravity * dt`), matching `cloth_sim.wgsl` (`params.gravity.xyz`).
     pub gravity: Vec3,
-    pub floor_y: f32,
     pub grab_idx: i32,
     pub grab_active: bool,
     pub grab_target: Vec3,
@@ -54,9 +53,6 @@ fn predict_particle(
         v *= max_v / speed;
     }
     let mut pos = sim + v * p.dt;
-    if pos.y < p.floor_y {
-        pos.y = p.floor_y;
-    }
     if p.grab_active && i as i32 == p.grab_idx {
         let mut pull = (p.grab_target - pos) * p.grab_stiffness;
         let pl = pull.length();
@@ -744,7 +740,6 @@ mod tests {
             jacobi_omega: u.jacobi_omega,
             inner_iterations: INNER_ITERS,
             gravity: u.gravity.xyz(),
-            floor_y: u.floor_y,
             grab_idx: u.grab_idx,
             grab_active: u.grab_active != 0,
             grab_target: u.grab_target.xyz(),
@@ -940,7 +935,6 @@ f 1/1 2/2 3/3
         let (mut jac_a, mut jac_b) = (vec![Vec3::ZERO; n], vec![Vec3::ZERO; n]);
         let mut sub = substep_params(&u);
         sub.gravity = Vec3::new(-1.0, -2.0, 0.5);
-        sub.floor_y = -10.0;
         sub.grab_active = false;
 
         #[cfg(feature = "solver-gauss-seidel")]

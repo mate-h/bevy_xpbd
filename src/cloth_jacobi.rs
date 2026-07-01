@@ -915,6 +915,34 @@ pub fn run_cloth_sim_jacobi(
     *last_ack_step_serial = ctrl.step_serial;
 }
 
+/// Restores GPU sim buffers to the mesh rest pose (positions, zero velocity, cleared λ).
+pub fn reset_cloth_sim_state_jacobi(
+    render_queue: &RenderQueue,
+    config: &ClothSimConfig,
+    buffers: &ClothSimBuffersJacobi,
+    render_pos: &Buffer,
+    render_nrm: &Buffer,
+) {
+    let n = config.num_particles as usize;
+    let ec = config.num_distance_constraints as usize;
+    let vec4_bytes = n * 16;
+    let f32_bytes = ec * 4;
+    let ip = bytemuck::cast_slice::<Vec4, u8>(&config.initial_pos);
+    render_queue.write_buffer(&buffers.sim_pos, 0, ip);
+    render_queue.write_buffer(&buffers.jac_a, 0, ip);
+    render_queue.write_buffer(&buffers.jac_b, 0, ip);
+    render_queue.write_buffer(&buffers.prev, 0, ip);
+    render_queue.write_buffer(&buffers.vel, 0, &vec![0u8; vec4_bytes]);
+    render_queue.write_buffer(&buffers.constraint_lambda, 0, &vec![0u8; f32_bytes]);
+    render_queue.write_buffer(&buffers.constraint_delta_lambda, 0, &vec![0u8; f32_bytes]);
+    render_queue.write_buffer(render_pos, 0, ip);
+    render_queue.write_buffer(
+        render_nrm,
+        0,
+        bytemuck::cast_slice::<Vec4, u8>(&config.initial_normals),
+    );
+}
+
 pub fn jacobi_default_omega() -> f32 {
     0.32
 }
