@@ -2,19 +2,22 @@
 
 This note records why the GPU cloth looked unstable or collapsed, and what changed to fix it.
 
-## 1. Solver: clear λ each inner iteration + Gauss–Seidel with batches
+## 1. Solver: clear λ each inner iteration
 
-XPBD uses a Lagrange multiplier λ per constraint (see Macklin et al., Eq. 17–18). The GPU solver uses **colored Gauss–Seidel**: constraints are sorted into **batches** (greedy edge coloring in `mesh_prep.rs`, **high-degree vertices first** to reduce the number of colors and thus `gs_edges` dispatches per inner iteration) so edges in one batch do not share particles; each batch runs in parallel via `gs_edges`, and batches run in order on a single **`jac_state`** buffer. Corrections apply immediately at both endpoints (**no Jacobi gather**).
+**Default build (`solver-jacobi`):** parallel **`jacobi_edges`** + **`jacobi_gather`** with ping‑pong `jac_a`/`jac_b` — see §4. **Optional `solver-gauss-seidel`:** colored batches below.
+
+XPBD uses a Lagrange multiplier λ per constraint (see Macklin et al., Eq. 17–18). The **Gauss–Seidel** GPU path uses **colored batches** (greedy edge coloring in `mesh_prep.rs`, **high-degree vertices first** to reduce the number of colors and thus `gs_edges` dispatches per inner iteration) so edges in one batch do not share particles; each batch runs in parallel via `gs_edges`, and batches run in order on a single **`jac_state`** buffer. Corrections apply immediately at both endpoints (**no Jacobi gather**).
 
 **Historical issue (Jacobi era):** λ was accumulated across inner iterations wrong for parallel Jacobi, which interacted badly with stale positions.
 
 **Current rule:** Zero λ (and Δλ storage) **before each inner iteration**:
 
-- GPU: **`clear_constraint_lambda`** then **`gs_edges`** once per batch; **all inner iterations of a substep** share **one** `cloth_pass_distance_gauss_seidel` compute pass (many ordered dispatches; storage writes are visible to the next dispatch per WebGPU/WGSL rules). GS batches use **`binding(19)`** dynamic-uniform **`set_bind_group` offsets** (256 B lut; **`queue.write_buffer`** between dispatches is still unsafe).
-- CPU reference (`xpbd_cpu.rs`): `lambda.fill(0.0)` at the start of each inner iteration, then sequential edge solves in **`constraint_*` row order** (same permutation as GPU).
-- Parity harness: same pattern in `gpu_cpu_parity.rs`.
+- GPU (Jacobi, default): **`clear_constraint_lambda`** → **`jacobi_edges`** → **`jacobi_gather`** per inner iter in **`cloth_pass_distance_jacobi`** (`src/cloth_jacobi.rs`).
+- GPU (GS feature): **`clear_constraint_lambda`** then **`gs_edges`** once per batch; **all inner iterations of a substep** share **one** `cloth_pass_distance_gauss_seidel` compute pass. GS batches use **`binding(19)`** dynamic-uniform **`set_bind_group` offsets**.
+- CPU reference (`xpbd_cpu.rs`): `lambda.fill(0.0)` at the start of each inner iteration.
+- Parity harness: `gpu_cpu_parity_jacobi.rs` (default) or `gpu_cpu_parity.rs` (GS feature).
 
-**Supporting tuning:** Stretch compliance stays near `DEFAULT_STRETCH_COMPLIANCE` (~`2e-8`) in `mesh_prep.rs`; `ClothSimUniforms::jacobi_omega` (default **`1.0`**) scales each distance correction (`gs_edges`). Lower it if needed; **`JACOBI_CORRECTION_CAP`** clamps each endpoint delta per constraint.
+**Supporting tuning:** Stretch compliance stays near `DEFAULT_STRETCH_COMPLIANCE` (~`2e-8`) in `mesh_prep.rs`. Default **`jacobi_omega`** is **`0.32`** (Jacobi) or **`1.0`** (GS feature); **`JACOBI_CORRECTION_CAP`** clamps each endpoint delta per constraint. **`grab_stiffness`** defaults to **`0.28`** (Jacobi) / **`0.45`** (GS); predict applies at most **`GRAB_MAX_PULL_PER_SUBSTEP`** (0.065 m) per substep toward the mouse target.
 
 ## 2. Rendering: correct particle index (the visual “ball”)
 
@@ -29,17 +32,33 @@ Without a reliable index, the GPU draws garbage positions while compute still up
 
 ## 3. CPU neighbor slices (mesh validation only)
 
-Neighbor lists (**`neighbor_offsets`**, **`neighbor_other`**, **`neighbor_constraint_id`**) remain on `ClothMeshData` after **batch‑sorted** constraints for regression tests and tooling. The GPU no longer uploads them.
+Neighbor lists (**`neighbor_offsets`**, **`neighbor_other`**, **`neighbor_constraint_id`**) remain on `ClothMeshData` for regression tests and tooling. The default **Jacobi** build uploads **`neighbor_offsets`** + **`neighbor_packed`** for **`jacobi_gather`** (`assets/shaders/cloth_sim_jacobi.wgsl`). With **`solver-gauss-seidel`**, neighbors stay CPU-only.
 
-**Invariant:** Built with **cursor‑based scatter** in `finalize_cloth_mesh` (`mesh_prep.rs`), aligned with permutation that puts constraints in contiguous color‑batch spans.
+**Invariant:** Built with **cursor‑based scatter** in `finalize_cloth_mesh` (`mesh_prep.rs`), aligned with batch-sorted constraint order.
 
 **Regression test:** `cloth_neighbor_slices_match_constraints` in `cloth_compute.rs` (`simulation_data_tests`).
+
+## 4. Compile-time solver choice (Jacobi vs Gauss–Seidel)
+
+| Feature | GPU shader | Distance solve | Default `jacobi_omega` |
+|---------|------------|----------------|------------------------|
+| `solver-jacobi` (default) | `cloth_sim_jacobi.wgsl` | **`jacobi_edges`** + **`jacobi_gather`** (ping‑pong `jac_a`/`jac_b`) | `0.32` |
+| `solver-gauss-seidel` | `cloth_sim.wgsl` | Colored **`gs_edges`** batches | `1.0` |
+
+Build Gauss–Seidel: `cargo build --no-default-features --features solver-gauss-seidel` (do **not** enable both solver features).
+
+Both paths **clear λ before each inner iteration** (stability rule from §1). Jacobi converges more slowly per iteration but uses **3 dispatches per inner iter** vs **`1 + B`** GS batch dispatches — profile with Instruments if comparing raw GPU time vs visual quality (match appearance, not iteration count).
+
+**Mouse grab (`cloth_xpbd`):** Jacobi needs **more inner iterations** than GS for the same visual stiffness under grab stress; the example uses **20** inner iters (Jacobi) vs **8** (GS). Do not grab **pinned** vertices (`inv_mass = 0`); picking skips them. If corners still blow up, lower **`grab_stiffness`** or raise **`solve_inner_iterations`** before lowering **`jacobi_omega`** further.
+
+**A/B profiling:** aggregate **`cloth_pass_distance_gauss_seidel`** vs **`cloth_pass_distance_jacobi`** rows in Metal GPU interval exports ([`XCTRACE_EXPORT.md`](../XCTRACE_EXPORT.md)).
 
 ## Quick reference (files)
 
 | Area | Location |
 |------|----------|
-| Inner‑loop λ clear + **`gs_edges`** (**`cloth_pass_distance_gauss_seidel`**) | `src/cloth_compute.rs` — `run_cloth_sim` |
+| Inner‑loop λ clear + **`gs_edges`** (**`cloth_pass_distance_gauss_seidel`**) | `src/cloth_compute.rs` — `run_cloth_sim` (GS feature) |
+| Jacobi inner loop (**`cloth_pass_distance_jacobi`**) | `src/cloth_jacobi.rs` — `run_cloth_sim_jacobi` (`solver-jacobi` feature) |
 | Solve budget + fuse **`predict_copy_sim_to_jac`** + collision stride | `src/cloth_compute.rs` — `ClothSimConfig`, `run_cloth_sim`; `assets/shaders/cloth_sim.wgsl` |
 | GS kernel | `assets/shaders/cloth_sim.wgsl` — `gs_edges` |
 | Inner‑loop λ clear + GS sweep (CPU) | `src/xpbd_cpu.rs` — `xpbd_substep_integrate` |

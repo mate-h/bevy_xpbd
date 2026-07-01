@@ -43,11 +43,17 @@ use bevy::{
 };
 use std::borrow::Cow;
 use std::num::NonZero;
+#[cfg(feature = "solver-gauss-seidel")]
 use std::ops::Deref;
 
 use crate::mesh_prep::ClothMeshData;
 
+#[cfg(feature = "solver-gauss-seidel")]
 pub const CLOTH_SHADER: &str = "shaders/cloth_sim.wgsl";
+#[cfg(feature = "solver-jacobi")]
+pub const CLOTH_SHADER: &str = "shaders/cloth_sim_jacobi.wgsl";
+#[cfg(feature = "solver-jacobi")]
+pub const CLOTH_SHADER_JACOBI: &str = "shaders/cloth_sim_jacobi.wgsl";
 /// XPBD (Müller et al.): use enough substeps so constraint corrections stay well-behaved vs. `dt`.
 /// More substeps shrink substep `dt` → XPBD `α̃ = α/dt²` stays moderate and implicit integration is stabler.
 pub const SUBSTEPS: u32 = 36;
@@ -76,6 +82,8 @@ pub const DEFAULT_LINEAR_AIR_DRAG_PER_SEC: f32 = 1.25;
 pub const JACOBI_CORRECTION_CAP: f32 = 0.28;
 /// Hard speed clamp after gravity in `predict` (m/s).
 pub const PREDICT_MAX_SPEED: f32 = 12.0;
+/// Max world-space pull toward `grab_target` per particle per substep (predict pass).
+pub const GRAB_MAX_PULL_PER_SUBSTEP: f32 = 0.065;
 /// Integer scale for GPU `atomicAdd` in self-collision narrow phase (`cloth_sim.wgsl`); CPU sums `f32` directly.
 pub const COLLISION_PAIR_FIXSCALE: i32 = 10_000;
 /// Clamp on accumulated self-collision displacement per particle per substep (`collide_apply`).
@@ -160,6 +168,10 @@ pub struct ClothSimConfig {
     pub initial_pos: Vec<Vec4>,
     pub render_positions: Handle<ShaderBuffer>,
     pub render_normals: Handle<ShaderBuffer>,
+    #[cfg(feature = "solver-jacobi")]
+    pub neighbor_offsets: Vec<u32>,
+    #[cfg(feature = "solver-jacobi")]
+    pub neighbor_packed: Vec<Vec4>,
 }
 
 #[derive(Resource, Clone, ExtractResource, Reflect, ShaderType)]
@@ -194,7 +206,16 @@ impl Default for ClothSimUniforms {
             inv_dt: 1.0 / sdt,
             num_particles: 0,
             num_tris: 0,
-            jacobi_omega: 1.0,
+            jacobi_omega: {
+                #[cfg(feature = "solver-jacobi")]
+                {
+                    crate::cloth_jacobi::jacobi_default_omega()
+                }
+                #[cfg(feature = "solver-gauss-seidel")]
+                {
+                    1.0
+                }
+            },
             inner_iterations: INNER_ITERS,
             thickness: THICKNESS,
             coll_scale: DEFAULT_COLL_SCALE,
@@ -202,7 +223,16 @@ impl Default for ClothSimUniforms {
             grab_target: Vec4::ZERO,
             grab_idx: -1,
             grab_active: 0,
-            grab_stiffness: 0.45,
+            grab_stiffness: {
+                #[cfg(feature = "solver-jacobi")]
+                {
+                    0.28
+                }
+                #[cfg(feature = "solver-gauss-seidel")]
+                {
+                    0.45
+                }
+            },
             floor_y: -2.0,
             linear_drag_per_sec: DEFAULT_LINEAR_AIR_DRAG_PER_SEC,
             constraint_batch_idx: 0,
@@ -314,6 +344,7 @@ impl ClothSimParamsGpu {
     }
 }
 
+#[cfg(feature = "solver-gauss-seidel")]
 #[derive(Resource)]
 pub struct ClothSimBuffers {
     /// `SimParams` (`var<uniform>`) — bytes from [`ClothSimParamsGpu`].
@@ -346,6 +377,7 @@ pub struct ClothSimBuffers {
     pub coll_cell_end_exclusive: Buffer,
 }
 
+#[cfg(feature = "solver-gauss-seidel")]
 #[derive(Resource)]
 struct ClothPipeline {
     layout: BindGroupLayoutDescriptor,
@@ -369,13 +401,14 @@ struct ClothPipeline {
     finalize_normals: CachedComputePipelineId,
 }
 
+#[cfg(feature = "solver-gauss-seidel")]
 #[derive(Resource)]
 struct ClothBindGroups {
     cloth: BindGroup,
 }
 
 #[derive(Resource, Default, Clone, Copy)]
-enum ClothLoadState {
+pub enum ClothLoadState {
     #[default]
     Loading,
     Ready,
@@ -442,9 +475,17 @@ fn init_cloth_sim(
     render_queue: Res<RenderQueue>,
     asset_server: Res<AssetServer>,
     pipeline_cache: Res<PipelineCache>,
-    existing: Option<Res<ClothSimBuffers>>,
+    #[cfg(feature = "solver-gauss-seidel")] existing: Option<Res<ClothSimBuffers>>,
+    #[cfg(feature = "solver-jacobi")] existing_j: Option<
+        Res<crate::cloth_jacobi::ClothSimBuffersJacobi>,
+    >,
 ) {
+    #[cfg(feature = "solver-gauss-seidel")]
     if existing.is_some() {
+        return;
+    }
+    #[cfg(feature = "solver-jacobi")]
+    if existing_j.is_some() {
         return;
     }
     let Some(config) = config else {
@@ -454,6 +495,42 @@ fn init_cloth_sim(
         return;
     }
 
+    #[cfg(feature = "solver-jacobi")]
+    {
+        crate::cloth_jacobi::init_cloth_sim_jacobi(
+            &mut commands,
+            &config,
+            uniforms.as_ref(),
+            &render_device,
+            &render_queue,
+            &asset_server,
+            &pipeline_cache,
+        );
+        return;
+    }
+
+    #[cfg(feature = "solver-gauss-seidel")]
+    init_cloth_sim_gauss_seidel(
+        &mut commands,
+        &config,
+        uniforms.as_ref(),
+        &render_device,
+        &render_queue,
+        &asset_server,
+        &pipeline_cache,
+    );
+}
+
+#[cfg(feature = "solver-gauss-seidel")]
+fn init_cloth_sim_gauss_seidel(
+    commands: &mut Commands,
+    config: &ClothSimConfig,
+    uniforms: &ClothSimUniforms,
+    render_device: &RenderDevice,
+    render_queue: &RenderQueue,
+    asset_server: &AssetServer,
+    pipeline_cache: &PipelineCache,
+) {
     let n = config.num_particles as usize;
     let n3 = n * 3;
     let vec4_sz = |count: usize| (count * 16) as u64;
@@ -469,7 +546,7 @@ fn init_cloth_sim(
         usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let initial_params = ClothSimParamsGpu::pack(uniforms.as_ref(), config.constraint_batch_count);
+    let initial_params = ClothSimParamsGpu::pack(uniforms, config.constraint_batch_count);
     render_queue.write_buffer(&params_uniform, 0, bytemuck::bytes_of(&initial_params));
 
     let sim_pos = render_device.create_buffer(&BufferDescriptor {
@@ -841,6 +918,7 @@ fn init_cloth_sim(
     });
 }
 
+#[cfg(feature = "solver-gauss-seidel")]
 fn make_bind_group(
     render_device: &RenderDevice,
     pipeline_cache: &PipelineCache,
@@ -893,8 +971,14 @@ fn make_bind_group(
 
 fn prepare_cloth_bind_groups(
     mut commands: Commands,
-    pipeline: Option<Res<ClothPipeline>>,
-    buffers: Option<Res<ClothSimBuffers>>,
+    #[cfg(feature = "solver-gauss-seidel")] pipeline: Option<Res<ClothPipeline>>,
+    #[cfg(feature = "solver-jacobi")] pipeline_j: Option<
+        Res<crate::cloth_jacobi::ClothPipelineJacobi>,
+    >,
+    #[cfg(feature = "solver-gauss-seidel")] buffers: Option<Res<ClothSimBuffers>>,
+    #[cfg(feature = "solver-jacobi")] buffers_j: Option<
+        Res<crate::cloth_jacobi::ClothSimBuffersJacobi>,
+    >,
     uniforms: Res<ClothSimUniforms>,
     config: Option<Res<ClothSimConfig>>,
     render_device: Res<RenderDevice>,
@@ -902,12 +986,6 @@ fn prepare_cloth_bind_groups(
     pipeline_cache: Res<PipelineCache>,
     gpu_sb: Res<RenderAssets<GpuShaderBuffer>>,
 ) {
-    let Some(pipeline) = pipeline else {
-        return;
-    };
-    let Some(buffers) = buffers else {
-        return;
-    };
     let Some(config) = config.as_ref() else {
         return;
     };
@@ -922,49 +1000,97 @@ fn prepare_cloth_bind_groups(
         return;
     }
 
-    let gpu_params = ClothSimParamsGpu::pack(uniforms.as_ref(), config.constraint_batch_count);
-    render_queue.write_buffer(&buffers.params_uniform, 0, bytemuck::bytes_of(&gpu_params));
+    #[cfg(feature = "solver-jacobi")]
+    {
+        let Some(pipeline) = pipeline_j else {
+            return;
+        };
+        let Some(buffers) = buffers_j else {
+            return;
+        };
+        crate::cloth_jacobi::prepare_cloth_bind_groups_jacobi(
+            &mut commands,
+            &pipeline,
+            &buffers,
+            uniforms.as_ref(),
+            config,
+            &render_device,
+            &render_queue,
+            &pipeline_cache,
+            gpu_rp,
+            gpu_rn,
+        );
+        return;
+    }
 
-    let gpu_grid = ClothCollGridGpu::pack_from_config(config);
-    render_queue.write_buffer(&buffers.coll_grid_uniform, 0, bytemuck::bytes_of(&gpu_grid));
+    #[cfg(feature = "solver-gauss-seidel")]
+    {
+        let Some(pipeline) = pipeline else {
+            return;
+        };
+        let Some(buffers) = buffers else {
+            return;
+        };
 
-    let cloth_bg = make_bind_group(
-        &render_device,
-        &pipeline_cache,
-        &pipeline.layout,
-        &buffers,
-        gpu_rp,
-        gpu_rn,
-    );
+        let gpu_params = ClothSimParamsGpu::pack(uniforms.as_ref(), config.constraint_batch_count);
+        render_queue.write_buffer(&buffers.params_uniform, 0, bytemuck::bytes_of(&gpu_params));
 
-    commands.insert_resource(ClothBindGroups { cloth: cloth_bg });
+        let gpu_grid = ClothCollGridGpu::pack_from_config(config);
+        render_queue.write_buffer(&buffers.coll_grid_uniform, 0, bytemuck::bytes_of(&gpu_grid));
+
+        let cloth_bg = make_bind_group(
+            &render_device,
+            &pipeline_cache,
+            &pipeline.layout,
+            &buffers,
+            gpu_rp,
+            gpu_rn,
+        );
+
+        commands.insert_resource(ClothBindGroups { cloth: cloth_bg });
+    }
 }
 
 fn check_cloth_pipeline(
     pipeline_cache: Res<PipelineCache>,
-    pipeline: Option<Res<ClothPipeline>>,
+    #[cfg(feature = "solver-gauss-seidel")] pipeline: Option<Res<ClothPipeline>>,
+    #[cfg(feature = "solver-jacobi")] pipeline_j: Option<
+        Res<crate::cloth_jacobi::ClothPipelineJacobi>,
+    >,
     mut state: ResMut<ClothLoadState>,
 ) {
-    let Some(pipeline) = pipeline.as_ref() else {
-        return;
-    };
-    if matches!(*state, ClothLoadState::Ready) {
+    #[cfg(feature = "solver-jacobi")]
+    {
+        let Some(pipeline) = pipeline_j.as_ref() else {
+            return;
+        };
+        crate::cloth_jacobi::check_cloth_pipeline_jacobi(&pipeline_cache, pipeline, &mut state);
         return;
     }
-    for id in [
-        pipeline.predict_copy_sim_to_jac,
-        pipeline.gs_edges,
-        pipeline.collide_grid_cells,
-        pipeline.finalize_normals,
-    ] {
-        match pipeline_cache.get_compute_pipeline_state(id) {
-            CachedPipelineState::Ok(_) => {}
-            CachedPipelineState::Err(ShaderCacheError::ShaderNotLoaded(_)) => return,
-            CachedPipelineState::Err(e) => panic!("cloth shader: {e}"),
-            _ => return,
+
+    #[cfg(feature = "solver-gauss-seidel")]
+    {
+        let Some(pipeline) = pipeline.as_ref() else {
+            return;
+        };
+        if matches!(*state, ClothLoadState::Ready) {
+            return;
         }
+        for id in [
+            pipeline.predict_copy_sim_to_jac,
+            pipeline.gs_edges,
+            pipeline.collide_grid_cells,
+            pipeline.finalize_normals,
+        ] {
+            match pipeline_cache.get_compute_pipeline_state(id) {
+                CachedPipelineState::Ok(_) => {}
+                CachedPipelineState::Err(ShaderCacheError::ShaderNotLoaded(_)) => return,
+                CachedPipelineState::Err(e) => panic!("cloth shader: {e}"),
+                _ => return,
+            }
+        }
+        *state = ClothLoadState::Ready;
     }
-    *state = ClothLoadState::Ready;
 }
 
 fn run_cloth_sim(
@@ -972,12 +1098,21 @@ fn run_cloth_sim(
     mut last_ack_step_serial: Local<u64>,
     ctrl: Res<ClothSimControl>,
     load_state: Res<ClothLoadState>,
-    bind_groups: Option<Res<ClothBindGroups>>,
-    pipeline: Option<Res<ClothPipeline>>,
+    #[cfg(feature = "solver-gauss-seidel")] bind_groups: Option<Res<ClothBindGroups>>,
+    #[cfg(feature = "solver-jacobi")] bind_groups_j: Option<
+        Res<crate::cloth_jacobi::ClothBindGroupsJacobi>,
+    >,
+    #[cfg(feature = "solver-gauss-seidel")] pipeline: Option<Res<ClothPipeline>>,
+    #[cfg(feature = "solver-jacobi")] pipeline_j: Option<
+        Res<crate::cloth_jacobi::ClothPipelineJacobi>,
+    >,
     pipeline_cache: Res<PipelineCache>,
     config: Option<Res<ClothSimConfig>>,
     uniforms: Res<ClothSimUniforms>,
-    collision_buffers: Option<Res<ClothSimBuffers>>,
+    #[cfg(feature = "solver-gauss-seidel")] collision_buffers: Option<Res<ClothSimBuffers>>,
+    #[cfg(feature = "solver-jacobi")] collision_buffers_j: Option<
+        Res<crate::cloth_jacobi::ClothSimBuffersJacobi>,
+    >,
     render_queue: Res<RenderQueue>,
 ) {
     if ctrl.sim_paused && ctrl.step_serial == *last_ack_step_serial {
@@ -986,13 +1121,69 @@ fn run_cloth_sim(
     if !matches!(*load_state, ClothLoadState::Ready) {
         return;
     }
+    let Some(config) = config else {
+        return;
+    };
+
+    #[cfg(feature = "solver-jacobi")]
+    {
+        let Some(bg) = bind_groups_j else {
+            return;
+        };
+        let Some(pipeline) = pipeline_j else {
+            return;
+        };
+        let Some(buffers) = collision_buffers_j else {
+            return;
+        };
+        let encoder = render_context.command_encoder();
+        crate::cloth_jacobi::run_cloth_sim_jacobi(
+            encoder,
+            &bg,
+            &pipeline,
+            &pipeline_cache,
+            &buffers,
+            &config,
+            uniforms.as_ref(),
+            &render_queue,
+            &mut last_ack_step_serial,
+            &ctrl,
+        );
+        return;
+    }
+
+    #[cfg(feature = "solver-gauss-seidel")]
+    run_cloth_sim_gauss_seidel(
+        &mut render_context,
+        &mut last_ack_step_serial,
+        &ctrl,
+        bind_groups,
+        pipeline,
+        &pipeline_cache,
+        &config,
+        &uniforms,
+        collision_buffers,
+        &render_queue,
+    );
+}
+
+#[cfg(feature = "solver-gauss-seidel")]
+fn run_cloth_sim_gauss_seidel(
+    render_context: &mut RenderContext,
+    last_ack_step_serial: &mut u64,
+    ctrl: &ClothSimControl,
+    bind_groups: Option<Res<ClothBindGroups>>,
+    pipeline: Option<Res<ClothPipeline>>,
+    pipeline_cache: &PipelineCache,
+    config: &ClothSimConfig,
+    uniforms: &ClothSimUniforms,
+    collision_buffers: Option<Res<ClothSimBuffers>>,
+    render_queue: &RenderQueue,
+) {
     let Some(bg) = bind_groups else {
         return;
     };
     let Some(pipeline) = pipeline else {
-        return;
-    };
-    let Some(config) = config else {
         return;
     };
     let Some(collision_buffers) = collision_buffers else {
@@ -1302,70 +1493,111 @@ mod uniform_layout_tests {
     }
 }
 
+#[cfg(feature = "solver-jacobi")]
 impl ClothMeshData {
     pub fn to_sim_config(&self, buf_assets: &mut Assets<ShaderBuffer>) -> ClothSimConfig {
-        let initial_pos: Vec<Vec4> = self
-            .positions
-            .iter()
-            .map(|p| Vec4::new(p.x, p.y, p.z, 0.0))
-            .collect();
-        let rest_pos: Vec<Vec4> = self
-            .rest_positions
-            .iter()
-            .map(|p| Vec4::new(p.x, p.y, p.z, 0.0))
-            .collect();
+        let neighbor_packed = crate::cloth_jacobi::pack_neighbor_gpu(self);
+        build_sim_config_jacobi(
+            self,
+            buf_assets,
+            self.neighbor_offsets.clone(),
+            neighbor_packed,
+        )
+    }
+}
 
-        let (
-            coll_grid_origin,
-            coll_grid_inv_cell,
-            coll_grid_dims,
-            coll_num_cells,
-            coll_radix_digits,
-        ) = crate::mesh_prep::derive_collision_grid(&rest_pos, THICKNESS);
+#[cfg(feature = "solver-gauss-seidel")]
+impl ClothMeshData {
+    pub fn to_sim_config(&self, buf_assets: &mut Assets<ShaderBuffer>) -> ClothSimConfig {
+        build_sim_config_gs(self, buf_assets)
+    }
+}
 
-        let initial_nrm: Vec<Vec4> = self
-            .normals
-            .iter()
-            .map(|v| Vec4::new(v.x, v.y, v.z, 0.0))
-            .collect();
+#[cfg(feature = "solver-jacobi")]
+fn build_sim_config_jacobi(
+    mesh: &ClothMeshData,
+    buf_assets: &mut Assets<ShaderBuffer>,
+    neighbor_offsets: Vec<u32>,
+    neighbor_packed: Vec<Vec4>,
+) -> ClothSimConfig {
+    let mut cfg = build_sim_config_core(mesh, buf_assets);
+    cfg.neighbor_offsets = neighbor_offsets;
+    cfg.neighbor_packed = neighbor_packed;
+    cfg
+}
 
-        let mut rp = ShaderBuffer::new(
-            bytemuck::cast_slice(&initial_pos),
-            RenderAssetUsages::RENDER_WORLD,
-        );
-        rp.buffer_description.usage =
-            BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC;
-        let mut rn = ShaderBuffer::new(
-            bytemuck::cast_slice(&initial_nrm),
-            RenderAssetUsages::RENDER_WORLD,
-        );
-        rn.buffer_description.usage =
-            BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC;
+#[cfg(feature = "solver-gauss-seidel")]
+fn build_sim_config_gs(
+    mesh: &ClothMeshData,
+    buf_assets: &mut Assets<ShaderBuffer>,
+) -> ClothSimConfig {
+    build_sim_config_core(mesh, buf_assets)
+}
 
-        ClothSimConfig {
-            solve_substeps: SUBSTEPS,
-            solve_inner_iterations: INNER_ITERS,
-            collision_every_n_substeps: 1,
-            coll_grid_origin,
-            coll_grid_inv_cell,
-            coll_grid_dims,
-            coll_num_cells,
-            coll_radix_digits,
-            render_positions: buf_assets.add(rp),
-            render_normals: buf_assets.add(rn),
-            num_particles: self.num_particles,
-            num_tris: (self.indices.len() / 3) as u32,
-            num_distance_constraints: self.num_distance_constraints,
-            constraint_batch_offsets: self.constraint_batch_offsets.clone(),
-            constraint_batch_count: self.constraint_batch_count,
-            constraint_i: self.constraint_i.clone(),
-            constraint_j: self.constraint_j.clone(),
-            constraint_rest_len: self.constraint_rest_len.clone(),
-            constraint_compliance: self.constraint_compliance.clone(),
-            tri_indices: self.indices.clone(),
-            inv_mass: self.inv_mass.clone(),
-            rest_pos,
-            initial_pos,
-        }
+fn build_sim_config_core(
+    mesh: &ClothMeshData,
+    buf_assets: &mut Assets<ShaderBuffer>,
+) -> ClothSimConfig {
+    let initial_pos: Vec<Vec4> = mesh
+        .positions
+        .iter()
+        .map(|p| Vec4::new(p.x, p.y, p.z, 0.0))
+        .collect();
+    let rest_pos: Vec<Vec4> = mesh
+        .rest_positions
+        .iter()
+        .map(|p| Vec4::new(p.x, p.y, p.z, 0.0))
+        .collect();
+
+    let (coll_grid_origin, coll_grid_inv_cell, coll_grid_dims, coll_num_cells, coll_radix_digits) =
+        crate::mesh_prep::derive_collision_grid(&rest_pos, THICKNESS);
+
+    let initial_nrm: Vec<Vec4> = mesh
+        .normals
+        .iter()
+        .map(|v| Vec4::new(v.x, v.y, v.z, 0.0))
+        .collect();
+
+    let mut rp = ShaderBuffer::new(
+        bytemuck::cast_slice(&initial_pos),
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    rp.buffer_description.usage =
+        BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC;
+    let mut rn = ShaderBuffer::new(
+        bytemuck::cast_slice(&initial_nrm),
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    rn.buffer_description.usage =
+        BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC;
+
+    ClothSimConfig {
+        solve_substeps: SUBSTEPS,
+        solve_inner_iterations: INNER_ITERS,
+        collision_every_n_substeps: 1,
+        coll_grid_origin,
+        coll_grid_inv_cell,
+        coll_grid_dims,
+        coll_num_cells,
+        coll_radix_digits,
+        render_positions: buf_assets.add(rp),
+        render_normals: buf_assets.add(rn),
+        num_particles: mesh.num_particles,
+        num_tris: (mesh.indices.len() / 3) as u32,
+        num_distance_constraints: mesh.num_distance_constraints,
+        constraint_batch_offsets: mesh.constraint_batch_offsets.clone(),
+        constraint_batch_count: mesh.constraint_batch_count,
+        constraint_i: mesh.constraint_i.clone(),
+        constraint_j: mesh.constraint_j.clone(),
+        constraint_rest_len: mesh.constraint_rest_len.clone(),
+        constraint_compliance: mesh.constraint_compliance.clone(),
+        tri_indices: mesh.indices.clone(),
+        inv_mass: mesh.inv_mass.clone(),
+        rest_pos,
+        initial_pos,
+        #[cfg(feature = "solver-jacobi")]
+        neighbor_offsets: Vec::new(),
+        #[cfg(feature = "solver-jacobi")]
+        neighbor_packed: Vec::new(),
     }
 }

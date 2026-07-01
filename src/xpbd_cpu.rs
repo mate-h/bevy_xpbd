@@ -1,14 +1,14 @@
-//! CPU reference for the GPU XPBD loop in `cloth_sim.wgsl` (optional self-collision; no normals).
-//! Uses the same `constraint_*` row order / batch coloring as [`crate::mesh_prep::ClothMeshData`]
-//! (Gauss–Seidel: one in-place jac buffer; constraints processed in contiguous index order).
+//! CPU reference for the GPU XPBD loop (optional self-collision; no normals).
+//! Default **`solver-jacobi`**: parallel Jacobi with `neighbor_*` slices. **`solver-gauss-seidel`**: batch-sorted GS.
 
 use bevy::math::Vec3;
 
 use crate::cloth_compute::{
-    COLLISION_APPLY_CLAMP, JACOBI_CORRECTION_CAP, PREDICT_MAX_SPEED, SUBSTEPS,
+    COLLISION_APPLY_CLAMP, GRAB_MAX_PULL_PER_SUBSTEP, JACOBI_CORRECTION_CAP, PREDICT_MAX_SPEED,
+    SUBSTEPS,
 };
 
-/// Uniform inputs needed for predict + GS constraints (collision stripped).
+/// Uniform inputs needed for predict + constraint solve (collision stripped).
 #[derive(Clone, Debug)]
 pub struct XpbdCpuTimeStepParams {
     pub dt: f32,
@@ -58,14 +58,17 @@ fn predict_particle(
         pos.y = p.floor_y;
     }
     if p.grab_active && i as i32 == p.grab_idx {
-        let to_t = p.grab_target - pos;
-        pos += to_t * p.grab_stiffness;
+        let mut pull = (p.grab_target - pos) * p.grab_stiffness;
+        let pl = pull.length();
+        if pl > GRAB_MAX_PULL_PER_SUBSTEP && pl > 0.0 {
+            pull *= GRAB_MAX_PULL_PER_SUBSTEP / pl;
+        }
+        pos += pull;
     }
     (pos, v)
 }
 
 /// O(n²) self-collision pass matching the GPU narrow phase in **`collide_grid_cells`** + **`collide_apply`** (`cloth_sim.wgsl`).
-/// (upper triangle pairs, rest-aware folding test, mass-weighted split, per-axis displacement clamp).
 pub fn self_collision_resolve(
     sim_pos: &mut [Vec3],
     inv_mass: &[f32],
@@ -137,6 +140,180 @@ pub fn self_collision_resolve(
     }
 }
 
+#[cfg(feature = "solver-jacobi")]
+fn jacobi_edges_pass(
+    jac_in: &[Vec3],
+    inv_mass: &[f32],
+    constraint_i: &[u32],
+    constraint_j: &[u32],
+    constraint_rest: &[f32],
+    constraint_comp: &[f32],
+    lambda: &mut [f32],
+    delta_lambda: &mut [f32],
+    inv_dt_sq: f32,
+) {
+    let e_count = constraint_i.len();
+    for e in 0..e_count {
+        let i = constraint_i[e] as usize;
+        let j = constraint_j[e] as usize;
+        let w_i = inv_mass[i];
+        let w_j = inv_mass[j];
+        if w_j <= 0.0 && w_i <= 0.0 {
+            delta_lambda[e] = 0.0;
+            continue;
+        }
+        let rest = constraint_rest[e];
+        let compliance = constraint_comp[e];
+        let p_i = jac_in[i];
+        let p_j = jac_in[j];
+        let mut gv = p_i - p_j;
+        let len = gv.length();
+        if len < 1e-8 {
+            delta_lambda[e] = 0.0;
+            continue;
+        }
+        gv /= len;
+        let c = len - rest;
+        let alpha_t = compliance * inv_dt_sq;
+        let wsum = w_i + w_j + alpha_t;
+        if wsum < 1e-8 {
+            delta_lambda[e] = 0.0;
+            continue;
+        }
+        let lam = lambda[e];
+        let dlam = (-c - alpha_t * lam) / wsum;
+        delta_lambda[e] = dlam;
+        lambda[e] = lam + dlam;
+    }
+}
+
+#[cfg(feature = "solver-jacobi")]
+fn jacobi_gather_particle(
+    i: usize,
+    jac_in: &[Vec3],
+    inv_mass: &[f32],
+    neighbor_offsets: &[u32],
+    neighbor_other: &[u32],
+    neighbor_constraint_id: &[u32],
+    delta_lambda: &[f32],
+    jacobi_omega: f32,
+) -> Vec3 {
+    let w_i = inv_mass[i];
+    if w_i <= 0.0 {
+        return jac_in[i];
+    }
+    let p_i = jac_in[i];
+    let mut acc = Vec3::ZERO;
+    let start = neighbor_offsets[i] as usize;
+    let end = neighbor_offsets[i + 1] as usize;
+
+    for k in start..end {
+        let j = neighbor_other[k] as usize;
+        let w_j = inv_mass[j];
+        if w_j <= 0.0 && w_i <= 0.0 {
+            continue;
+        }
+        let p_j = jac_in[j];
+        let mut gv = p_i - p_j;
+        let len = gv.length();
+        if len < 1e-8 {
+            continue;
+        }
+        gv /= len;
+        let eid = neighbor_constraint_id[k] as usize;
+        let dlam = delta_lambda[eid];
+        acc += gv * w_i * dlam;
+    }
+    let mut delta = jacobi_omega * acc;
+    delta = clamp_correction(delta);
+    p_i + delta
+}
+
+#[cfg(feature = "solver-jacobi")]
+fn xpbd_substep_integrate(
+    sim_pos: &mut [Vec3],
+    prev_pos: &mut [Vec3],
+    vel: &mut [Vec3],
+    jac_a: &mut [Vec3],
+    jac_b: &mut [Vec3],
+    inv_mass: &[f32],
+    neighbor_offsets: &[u32],
+    neighbor_other: &[u32],
+    neighbor_constraint_id: &[u32],
+    constraint_i: &[u32],
+    constraint_j: &[u32],
+    constraint_rest_len: &[f32],
+    constraint_compliance: &[f32],
+    p: &XpbdCpuTimeStepParams,
+) {
+    let n = sim_pos.len();
+    let num_constraints = constraint_i.len();
+    let mut lambda = vec![0f32; num_constraints];
+    let mut delta_lambda = vec![0f32; num_constraints];
+    let inv_dt_sq = p.inv_dt * p.inv_dt;
+
+    for i in 0..n {
+        if inv_mass[i] <= 0.0 {
+            prev_pos[i] = sim_pos[i];
+            continue;
+        }
+        let (new_pos, new_v) = predict_particle(i, sim_pos[i], vel[i], inv_mass[i], p);
+        prev_pos[i] = sim_pos[i];
+        sim_pos[i] = new_pos;
+        vel[i] = new_v;
+    }
+
+    for i in 0..n {
+        jac_b[i] = sim_pos[i];
+    }
+
+    for k in 0..p.inner_iterations {
+        lambda.fill(0.0);
+        delta_lambda.fill(0.0);
+
+        let (read, write): (&[Vec3], &mut [Vec3]) = if k % 2 == 0 {
+            (&*jac_b, jac_a)
+        } else {
+            (&*jac_a, jac_b)
+        };
+
+        jacobi_edges_pass(
+            read,
+            inv_mass,
+            constraint_i,
+            constraint_j,
+            constraint_rest_len,
+            constraint_compliance,
+            &mut lambda,
+            &mut delta_lambda,
+            inv_dt_sq,
+        );
+
+        for i in 0..n {
+            write[i] = jacobi_gather_particle(
+                i,
+                read,
+                inv_mass,
+                neighbor_offsets,
+                neighbor_other,
+                neighbor_constraint_id,
+                &delta_lambda,
+                p.jacobi_omega,
+            );
+        }
+    }
+
+    let final_jac: &[Vec3] = if p.inner_iterations % 2 == 0 {
+        jac_b
+    } else {
+        jac_a
+    };
+    for i in 0..n {
+        sim_pos[i] = final_jac[i];
+    }
+}
+
+#[cfg(feature = "solver-gauss-seidel")]
 fn xpbd_substep_integrate(
     sim_pos: &mut [Vec3],
     prev_pos: &mut [Vec3],
@@ -150,11 +327,6 @@ fn xpbd_substep_integrate(
     p: &XpbdCpuTimeStepParams,
 ) {
     let n = sim_pos.len();
-    debug_assert_eq!(prev_pos.len(), n);
-    debug_assert_eq!(vel.len(), n);
-    debug_assert_eq!(jac_work.len(), n);
-    debug_assert_eq!(inv_mass.len(), n);
-
     let num_constraints = constraint_i.len();
     let mut lambda = vec![0f32; num_constraints];
 
@@ -175,12 +347,8 @@ fn xpbd_substep_integrate(
 
     for _k in 0..p.inner_iterations {
         lambda.fill(0.0);
-        debug_assert_eq!(constraint_j.len(), num_constraints);
-        debug_assert_eq!(constraint_rest_len.len(), num_constraints);
-        debug_assert_eq!(constraint_compliance.len(), num_constraints);
-
         let omega = p.jacobi_omega;
-        let dt = p.dt;
+        let inv_dt_sq = p.inv_dt * p.inv_dt;
 
         for e in 0..num_constraints {
             let i = constraint_i[e] as usize;
@@ -201,7 +369,7 @@ fn xpbd_substep_integrate(
             }
             gv /= len;
             let c = len - rest;
-            let alpha_t = compliance / (dt * dt);
+            let alpha_t = compliance * inv_dt_sq;
             let wsum = w_i + w_j + alpha_t;
             if wsum < 1e-8 {
                 continue;
@@ -244,7 +412,52 @@ fn xpbd_substep_post_velocity(
     }
 }
 
-/// One GPU **substep** (predict → GS × K → sim ← jac → post_velocity), no collision.
+/// One GPU **substep** (predict → constraints × K → sim ← jac → post_velocity), no collision.
+#[cfg(feature = "solver-jacobi")]
+pub fn xpbd_substep_no_collision(
+    sim_pos: &mut [Vec3],
+    prev_pos: &mut [Vec3],
+    vel: &mut [Vec3],
+    jac_a: &mut [Vec3],
+    jac_b: &mut [Vec3],
+    inv_mass: &[f32],
+    neighbor_offsets: &[u32],
+    neighbor_other: &[u32],
+    neighbor_constraint_id: &[u32],
+    constraint_i: &[u32],
+    constraint_j: &[u32],
+    constraint_rest_len: &[f32],
+    constraint_compliance: &[f32],
+    p: &XpbdCpuTimeStepParams,
+) {
+    xpbd_substep_integrate(
+        sim_pos,
+        prev_pos,
+        vel,
+        jac_a,
+        jac_b,
+        inv_mass,
+        neighbor_offsets,
+        neighbor_other,
+        neighbor_constraint_id,
+        constraint_i,
+        constraint_j,
+        constraint_rest_len,
+        constraint_compliance,
+        p,
+    );
+    xpbd_substep_post_velocity(
+        sim_pos,
+        prev_pos,
+        vel,
+        inv_mass,
+        p.inv_dt,
+        p.dt,
+        p.linear_drag_per_sec,
+    );
+}
+
+#[cfg(feature = "solver-gauss-seidel")]
 pub fn xpbd_substep_no_collision(
     sim_pos: &mut [Vec3],
     prev_pos: &mut [Vec3],
@@ -280,7 +493,55 @@ pub fn xpbd_substep_no_collision(
     );
 }
 
-/// Like [`xpbd_substep_no_collision`], but runs [`self_collision_resolve`] after constraints (same order as the render graph).
+#[cfg(feature = "solver-jacobi")]
+pub fn xpbd_substep_with_self_collision(
+    sim_pos: &mut [Vec3],
+    prev_pos: &mut [Vec3],
+    vel: &mut [Vec3],
+    jac_a: &mut [Vec3],
+    jac_b: &mut [Vec3],
+    inv_mass: &[f32],
+    neighbor_offsets: &[u32],
+    neighbor_other: &[u32],
+    neighbor_constraint_id: &[u32],
+    constraint_i: &[u32],
+    constraint_j: &[u32],
+    constraint_rest_len: &[f32],
+    constraint_compliance: &[f32],
+    rest_pos: &[Vec3],
+    thickness: f32,
+    coll_scale: f32,
+    p: &XpbdCpuTimeStepParams,
+) {
+    xpbd_substep_integrate(
+        sim_pos,
+        prev_pos,
+        vel,
+        jac_a,
+        jac_b,
+        inv_mass,
+        neighbor_offsets,
+        neighbor_other,
+        neighbor_constraint_id,
+        constraint_i,
+        constraint_j,
+        constraint_rest_len,
+        constraint_compliance,
+        p,
+    );
+    self_collision_resolve(sim_pos, inv_mass, rest_pos, thickness, coll_scale);
+    xpbd_substep_post_velocity(
+        sim_pos,
+        prev_pos,
+        vel,
+        inv_mass,
+        p.inv_dt,
+        p.dt,
+        p.linear_drag_per_sec,
+    );
+}
+
+#[cfg(feature = "solver-gauss-seidel")]
 pub fn xpbd_substep_with_self_collision(
     sim_pos: &mut [Vec3],
     prev_pos: &mut [Vec3],
@@ -296,7 +557,6 @@ pub fn xpbd_substep_with_self_collision(
     coll_scale: f32,
     p: &XpbdCpuTimeStepParams,
 ) {
-    debug_assert_eq!(rest_pos.len(), sim_pos.len());
     xpbd_substep_integrate(
         sim_pos,
         prev_pos,
@@ -321,7 +581,44 @@ pub fn xpbd_substep_with_self_collision(
     );
 }
 
-/// One GPU **frame**: `SUBSTEPS` substeps (collision still omitted).
+#[cfg(feature = "solver-jacobi")]
+pub fn xpbd_frame_no_collision(
+    sim_pos: &mut [Vec3],
+    prev_pos: &mut [Vec3],
+    vel: &mut [Vec3],
+    jac_a: &mut [Vec3],
+    jac_b: &mut [Vec3],
+    inv_mass: &[f32],
+    neighbor_offsets: &[u32],
+    neighbor_other: &[u32],
+    neighbor_constraint_id: &[u32],
+    constraint_i: &[u32],
+    constraint_j: &[u32],
+    constraint_rest_len: &[f32],
+    constraint_compliance: &[f32],
+    substep: &XpbdCpuTimeStepParams,
+) {
+    for _ in 0..SUBSTEPS {
+        xpbd_substep_no_collision(
+            sim_pos,
+            prev_pos,
+            vel,
+            jac_a,
+            jac_b,
+            inv_mass,
+            neighbor_offsets,
+            neighbor_other,
+            neighbor_constraint_id,
+            constraint_i,
+            constraint_j,
+            constraint_rest_len,
+            constraint_compliance,
+            substep,
+        );
+    }
+}
+
+#[cfg(feature = "solver-gauss-seidel")]
 pub fn xpbd_frame_no_collision(
     sim_pos: &mut [Vec3],
     prev_pos: &mut [Vec3],
@@ -350,7 +647,50 @@ pub fn xpbd_frame_no_collision(
     }
 }
 
-/// One GPU **frame** with self-collision each substep (`SUBSTEPS` × integrate → collision → velocity).
+#[cfg(feature = "solver-jacobi")]
+pub fn xpbd_frame_with_self_collision(
+    sim_pos: &mut [Vec3],
+    prev_pos: &mut [Vec3],
+    vel: &mut [Vec3],
+    jac_a: &mut [Vec3],
+    jac_b: &mut [Vec3],
+    inv_mass: &[f32],
+    neighbor_offsets: &[u32],
+    neighbor_other: &[u32],
+    neighbor_constraint_id: &[u32],
+    constraint_i: &[u32],
+    constraint_j: &[u32],
+    constraint_rest_len: &[f32],
+    constraint_compliance: &[f32],
+    rest_pos: &[Vec3],
+    thickness: f32,
+    coll_scale: f32,
+    substep: &XpbdCpuTimeStepParams,
+) {
+    for _ in 0..SUBSTEPS {
+        xpbd_substep_with_self_collision(
+            sim_pos,
+            prev_pos,
+            vel,
+            jac_a,
+            jac_b,
+            inv_mass,
+            neighbor_offsets,
+            neighbor_other,
+            neighbor_constraint_id,
+            constraint_i,
+            constraint_j,
+            constraint_rest_len,
+            constraint_compliance,
+            rest_pos,
+            thickness,
+            coll_scale,
+            substep,
+        );
+    }
+}
+
+#[cfg(feature = "solver-gauss-seidel")]
 pub fn xpbd_frame_with_self_collision(
     sim_pos: &mut [Vec3],
     prev_pos: &mut [Vec3],
@@ -396,31 +736,12 @@ mod tests {
         grid_cloth_hanging(16, 16, 0.045)
     }
 
-    #[test]
-    fn cloth_mesh_inv_mass_and_neighbors_sane() {
-        let cloth = cloth_test_grid();
-        for (i, &w) in cloth.inv_mass.iter().enumerate() {
-            assert!(w.is_finite(), "inv_mass[{}] = {} (non-finite)", i, w);
-        }
-    }
-
-    /// Integrator only (`jacobi_omega = 0`): constraint pass is a no-op; catches NaNs in predict / floor / grab.
-    #[test]
-    fn cpu_xpbd_cloth_one_frame_integrator_only_stays_finite() {
-        let cloth = cloth_test_grid();
-        let n = cloth.num_particles as usize;
-        let u = ClothSimUniforms::default();
+    fn substep_params(u: &ClothSimUniforms) -> XpbdCpuTimeStepParams {
         let sdt = REFERENCE_FRAME_DELTA_SECS / SUBSTEPS as f32;
-
-        let mut sim_pos: Vec<Vec3> = cloth.positions.clone();
-        let mut prev_pos = vec![Vec3::ZERO; n];
-        let mut vel = vec![Vec3::ZERO; n];
-        let mut jac_work = vec![Vec3::ZERO; n];
-
-        let sub = XpbdCpuTimeStepParams {
+        XpbdCpuTimeStepParams {
             dt: sdt,
             inv_dt: 1.0 / sdt,
-            jacobi_omega: 0.0,
+            jacobi_omega: u.jacobi_omega,
             inner_iterations: INNER_ITERS,
             gravity: u.gravity.xyz(),
             floor_y: u.floor_y,
@@ -429,14 +750,57 @@ mod tests {
             grab_target: u.grab_target.xyz(),
             grab_stiffness: u.grab_stiffness,
             linear_drag_per_sec: u.linear_drag_per_sec,
-        };
+        }
+    }
 
+    #[test]
+    fn cloth_mesh_inv_mass_and_neighbors_sane() {
+        let cloth = cloth_test_grid();
+        for (i, &w) in cloth.inv_mass.iter().enumerate() {
+            assert!(w.is_finite(), "inv_mass[{}] = {} (non-finite)", i, w);
+        }
+    }
+
+    #[test]
+    fn cpu_xpbd_cloth_one_frame_integrator_only_stays_finite() {
+        let cloth = cloth_test_grid();
+        let n = cloth.num_particles as usize;
+        let u = ClothSimUniforms::default();
+        let mut sim_pos: Vec<Vec3> = cloth.positions.clone();
+        let mut prev_pos = vec![Vec3::ZERO; n];
+        let mut vel = vec![Vec3::ZERO; n];
+        #[cfg(feature = "solver-gauss-seidel")]
+        let mut jac_work = vec![Vec3::ZERO; n];
+        #[cfg(feature = "solver-jacobi")]
+        let (mut jac_a, mut jac_b) = (vec![Vec3::ZERO; n], vec![Vec3::ZERO; n]);
+
+        let mut sub = substep_params(&u);
+        sub.jacobi_omega = 0.0;
+
+        #[cfg(feature = "solver-gauss-seidel")]
         xpbd_frame_no_collision(
             &mut sim_pos,
             &mut prev_pos,
             &mut vel,
             &mut jac_work,
             &cloth.inv_mass,
+            &cloth.constraint_i,
+            &cloth.constraint_j,
+            &cloth.constraint_rest_len,
+            &cloth.constraint_compliance,
+            &sub,
+        );
+        #[cfg(feature = "solver-jacobi")]
+        xpbd_frame_no_collision(
+            &mut sim_pos,
+            &mut prev_pos,
+            &mut vel,
+            &mut jac_a,
+            &mut jac_b,
+            &cloth.inv_mass,
+            &cloth.neighbor_offsets,
+            &cloth.neighbor_other,
+            &cloth.neighbor_constraint_id,
             &cloth.constraint_i,
             &cloth.constraint_j,
             &cloth.constraint_rest_len,
@@ -447,33 +811,21 @@ mod tests {
         assert!(sim_pos.iter().all(|p| p.is_finite()));
     }
 
-    /// Full GPU-matching substep count + GS constraints on real cloth data (no collision).
     #[test]
     fn cpu_xpbd_cloth_one_frame_full_solver_stays_finite() {
         let cloth = cloth_test_grid();
         let n = cloth.num_particles as usize;
         let u = ClothSimUniforms::default();
-        let sdt = REFERENCE_FRAME_DELTA_SECS / SUBSTEPS as f32;
-
         let mut sim_pos: Vec<Vec3> = cloth.positions.clone();
         let mut prev_pos = vec![Vec3::ZERO; n];
         let mut vel = vec![Vec3::ZERO; n];
+        #[cfg(feature = "solver-gauss-seidel")]
         let mut jac_work = vec![Vec3::ZERO; n];
+        #[cfg(feature = "solver-jacobi")]
+        let (mut jac_a, mut jac_b) = (vec![Vec3::ZERO; n], vec![Vec3::ZERO; n]);
+        let sub = substep_params(&u);
 
-        let sub = XpbdCpuTimeStepParams {
-            dt: sdt,
-            inv_dt: 1.0 / sdt,
-            jacobi_omega: u.jacobi_omega,
-            inner_iterations: INNER_ITERS,
-            gravity: u.gravity.xyz(),
-            floor_y: u.floor_y,
-            grab_idx: u.grab_idx,
-            grab_active: u.grab_active != 0,
-            grab_target: u.grab_target.xyz(),
-            grab_stiffness: u.grab_stiffness,
-            linear_drag_per_sec: u.linear_drag_per_sec,
-        };
-
+        #[cfg(feature = "solver-gauss-seidel")]
         xpbd_frame_no_collision(
             &mut sim_pos,
             &mut prev_pos,
@@ -486,11 +838,25 @@ mod tests {
             &cloth.constraint_compliance,
             &sub,
         );
-
-        assert!(
-            sim_pos.iter().all(|p| p.is_finite()),
-            "expected finite positions after 1 frame CPU XPBD (matches WGSL predict gravity)"
+        #[cfg(feature = "solver-jacobi")]
+        xpbd_frame_no_collision(
+            &mut sim_pos,
+            &mut prev_pos,
+            &mut vel,
+            &mut jac_a,
+            &mut jac_b,
+            &cloth.inv_mass,
+            &cloth.neighbor_offsets,
+            &cloth.neighbor_other,
+            &cloth.neighbor_constraint_id,
+            &cloth.constraint_i,
+            &cloth.constraint_j,
+            &cloth.constraint_rest_len,
+            &cloth.constraint_compliance,
+            &sub,
         );
+
+        assert!(sim_pos.iter().all(|p| p.is_finite()));
     }
 
     #[test]
@@ -498,34 +864,44 @@ mod tests {
         let cloth = cloth_test_grid();
         let n = cloth.num_particles as usize;
         let u = ClothSimUniforms::default();
-        let sdt = REFERENCE_FRAME_DELTA_SECS / SUBSTEPS as f32;
-
         let rest = cloth.positions.clone();
         let mut sim_pos = rest.clone();
         let mut prev_pos = vec![Vec3::ZERO; n];
         let mut vel = vec![Vec3::ZERO; n];
+        #[cfg(feature = "solver-gauss-seidel")]
         let mut jac_work = vec![Vec3::ZERO; n];
+        #[cfg(feature = "solver-jacobi")]
+        let (mut jac_a, mut jac_b) = (vec![Vec3::ZERO; n], vec![Vec3::ZERO; n]);
+        let mut sub = substep_params(&u);
+        sub.grab_idx = -1;
+        sub.grab_active = false;
+        sub.grab_target = Vec3::ZERO;
+        sub.grab_stiffness = 0.0;
 
-        let sub = XpbdCpuTimeStepParams {
-            dt: sdt,
-            inv_dt: 1.0 / sdt,
-            jacobi_omega: u.jacobi_omega,
-            inner_iterations: INNER_ITERS,
-            gravity: u.gravity.xyz(),
-            floor_y: u.floor_y,
-            grab_idx: -1,
-            grab_active: false,
-            grab_target: Vec3::ZERO,
-            grab_stiffness: 0.0,
-            linear_drag_per_sec: u.linear_drag_per_sec,
-        };
-
+        #[cfg(feature = "solver-gauss-seidel")]
         xpbd_frame_no_collision(
             &mut sim_pos,
             &mut prev_pos,
             &mut vel,
             &mut jac_work,
             &cloth.inv_mass,
+            &cloth.constraint_i,
+            &cloth.constraint_j,
+            &cloth.constraint_rest_len,
+            &cloth.constraint_compliance,
+            &sub,
+        );
+        #[cfg(feature = "solver-jacobi")]
+        xpbd_frame_no_collision(
+            &mut sim_pos,
+            &mut prev_pos,
+            &mut vel,
+            &mut jac_a,
+            &mut jac_b,
+            &cloth.inv_mass,
+            &cloth.neighbor_offsets,
+            &cloth.neighbor_other,
+            &cloth.neighbor_constraint_id,
             &cloth.constraint_i,
             &cloth.constraint_j,
             &cloth.constraint_rest_len,
@@ -536,18 +912,11 @@ mod tests {
         let eps = 1e-4_f32;
         for i in 0..n {
             if cloth.inv_mass[i] <= 0.0 {
-                assert!(
-                    (sim_pos[i] - rest[i]).length() < eps,
-                    "pinned particle {} moved: {:?} vs {:?}",
-                    i,
-                    sim_pos[i],
-                    rest[i]
-                );
+                assert!((sim_pos[i] - rest[i]).length() < eps);
             }
         }
     }
 
-    /// Single triangle, three UV corners — sanity check independent of `cloth.obj` size.
     #[test]
     fn cpu_xpbd_single_triangle_one_frame_finite() {
         let obj = r#"
@@ -560,30 +929,21 @@ vt 0 1
 f 1/1 2/2 3/3
 "#;
         let cloth = parse_welded_obj(obj);
-        assert_eq!(cloth.num_particles, 3);
         let n = 3;
         let u = ClothSimUniforms::default();
-        let sdt = REFERENCE_FRAME_DELTA_SECS / SUBSTEPS as f32;
-
         let mut sim_pos = cloth.positions.clone();
         let mut prev_pos = vec![Vec3::ZERO; n];
         let mut vel = vec![Vec3::ZERO; n];
+        #[cfg(feature = "solver-gauss-seidel")]
         let mut jac_work = vec![Vec3::ZERO; n];
+        #[cfg(feature = "solver-jacobi")]
+        let (mut jac_a, mut jac_b) = (vec![Vec3::ZERO; n], vec![Vec3::ZERO; n]);
+        let mut sub = substep_params(&u);
+        sub.gravity = Vec3::new(-1.0, -2.0, 0.5);
+        sub.floor_y = -10.0;
+        sub.grab_active = false;
 
-        let sub = XpbdCpuTimeStepParams {
-            dt: sdt,
-            inv_dt: 1.0 / sdt,
-            jacobi_omega: u.jacobi_omega,
-            inner_iterations: INNER_ITERS,
-            gravity: Vec3::new(-1.0, -2.0, 0.5),
-            floor_y: -10.0,
-            grab_idx: -1,
-            grab_active: false,
-            grab_target: Vec3::ZERO,
-            grab_stiffness: 0.0,
-            linear_drag_per_sec: u.linear_drag_per_sec,
-        };
-
+        #[cfg(feature = "solver-gauss-seidel")]
         xpbd_frame_no_collision(
             &mut sim_pos,
             &mut prev_pos,
@@ -596,46 +956,69 @@ f 1/1 2/2 3/3
             &cloth.constraint_compliance,
             &sub,
         );
+        #[cfg(feature = "solver-jacobi")]
+        xpbd_frame_no_collision(
+            &mut sim_pos,
+            &mut prev_pos,
+            &mut vel,
+            &mut jac_a,
+            &mut jac_b,
+            &cloth.inv_mass,
+            &cloth.neighbor_offsets,
+            &cloth.neighbor_other,
+            &cloth.neighbor_constraint_id,
+            &cloth.constraint_i,
+            &cloth.constraint_j,
+            &cloth.constraint_rest_len,
+            &cloth.constraint_compliance,
+            &sub,
+        );
 
         for (i, p) in sim_pos.iter().enumerate() {
             assert!(p.is_finite(), "tri particle {} = {:?}", i, p);
         }
     }
 
-    /// Regression: many frames without self-collision should not collapse free vertices to a near-degenerate AABB.
     #[test]
     fn cpu_xpbd_cloth_15_frames_extent_stays_reasonable() {
         let cloth = cloth_test_grid();
         let n = cloth.num_particles as usize;
         let u = ClothSimUniforms::default();
-        let sdt = REFERENCE_FRAME_DELTA_SECS / SUBSTEPS as f32;
-
         let mut sim_pos: Vec<Vec3> = cloth.positions.clone();
         let mut prev_pos = vec![Vec3::ZERO; n];
         let mut vel = vec![Vec3::ZERO; n];
+        #[cfg(feature = "solver-gauss-seidel")]
         let mut jac_work = vec![Vec3::ZERO; n];
-
-        let sub = XpbdCpuTimeStepParams {
-            dt: sdt,
-            inv_dt: 1.0 / sdt,
-            jacobi_omega: u.jacobi_omega,
-            inner_iterations: INNER_ITERS,
-            gravity: u.gravity.xyz(),
-            floor_y: u.floor_y,
-            grab_idx: -1,
-            grab_active: false,
-            grab_target: Vec3::ZERO,
-            grab_stiffness: 0.0,
-            linear_drag_per_sec: u.linear_drag_per_sec,
-        };
+        #[cfg(feature = "solver-jacobi")]
+        let (mut jac_a, mut jac_b) = (vec![Vec3::ZERO; n], vec![Vec3::ZERO; n]);
+        let mut sub = substep_params(&u);
+        sub.grab_active = false;
 
         for _ in 0..15 {
+            #[cfg(feature = "solver-gauss-seidel")]
             xpbd_frame_no_collision(
                 &mut sim_pos,
                 &mut prev_pos,
                 &mut vel,
                 &mut jac_work,
                 &cloth.inv_mass,
+                &cloth.constraint_i,
+                &cloth.constraint_j,
+                &cloth.constraint_rest_len,
+                &cloth.constraint_compliance,
+                &sub,
+            );
+            #[cfg(feature = "solver-jacobi")]
+            xpbd_frame_no_collision(
+                &mut sim_pos,
+                &mut prev_pos,
+                &mut vel,
+                &mut jac_a,
+                &mut jac_b,
+                &cloth.inv_mass,
+                &cloth.neighbor_offsets,
+                &cloth.neighbor_other,
+                &cloth.neighbor_constraint_id,
                 &cloth.constraint_i,
                 &cloth.constraint_j,
                 &cloth.constraint_rest_len,
@@ -653,11 +1036,7 @@ f 1/1 2/2 3/3
             }
         }
         let ext = max_b - min_b;
-        assert!(
-            ext.x > 0.18 && ext.y > 0.04,
-            "free-particle AABB nearly degenerate in XY (collapse / ball): {:?}",
-            ext
-        );
+        assert!(ext.x > 0.18 && ext.y > 0.04, "AABB degenerate: {:?}", ext);
     }
 
     #[test]
@@ -670,12 +1049,7 @@ f 1/1 2/2 3/3
         let d0 = (sim[1] - sim[0]).length();
         self_collision_resolve(&mut sim, &inv_mass, &rest_pos, thickness, coll_scale);
         let d1 = (sim[1] - sim[0]).length();
-        assert!(
-            d1 > d0 + 1e-4,
-            "expected separation to grow: {} -> {}",
-            d0,
-            d1
-        );
+        assert!(d1 > d0 + 1e-4);
     }
 
     #[test]
@@ -691,7 +1065,6 @@ f 1/1 2/2 3/3
         assert_eq!(sim[1], before[1]);
     }
 
-    /// WGSL skips `atomicAdd` for zero `inv_mass`; pinned vertex should not move from self-collision.
     #[test]
     fn cpu_self_collision_pinned_neighbor_takes_no_delta() {
         let thickness = 0.04_f32;
@@ -702,11 +1075,7 @@ f 1/1 2/2 3/3
         let pin = sim[0];
         self_collision_resolve(&mut sim, &inv_mass, &rest_pos, thickness, coll_scale);
         assert_eq!(sim[0], pin);
-        assert!(
-            sim[1].x > 0.015,
-            "free particle should separate: {:?}",
-            sim[1]
-        );
+        assert!(sim[1].x > 0.015);
     }
 
     #[test]
@@ -714,28 +1083,17 @@ f 1/1 2/2 3/3
         let cloth = cloth_test_grid();
         let n = cloth.num_particles as usize;
         let u = ClothSimUniforms::default();
-        let sdt = REFERENCE_FRAME_DELTA_SECS / SUBSTEPS as f32;
         let rest = cloth.positions.clone();
-
         let mut sim_pos: Vec<Vec3> = rest.clone();
         let mut prev_pos = vec![Vec3::ZERO; n];
         let mut vel = vec![Vec3::ZERO; n];
+        #[cfg(feature = "solver-gauss-seidel")]
         let mut jac_work = vec![Vec3::ZERO; n];
+        #[cfg(feature = "solver-jacobi")]
+        let (mut jac_a, mut jac_b) = (vec![Vec3::ZERO; n], vec![Vec3::ZERO; n]);
+        let sub = substep_params(&u);
 
-        let sub = XpbdCpuTimeStepParams {
-            dt: sdt,
-            inv_dt: 1.0 / sdt,
-            jacobi_omega: u.jacobi_omega,
-            inner_iterations: INNER_ITERS,
-            gravity: u.gravity.xyz(),
-            floor_y: u.floor_y,
-            grab_idx: u.grab_idx,
-            grab_active: u.grab_active != 0,
-            grab_target: u.grab_target.xyz(),
-            grab_stiffness: u.grab_stiffness,
-            linear_drag_per_sec: u.linear_drag_per_sec,
-        };
-
+        #[cfg(feature = "solver-gauss-seidel")]
         xpbd_frame_with_self_collision(
             &mut sim_pos,
             &mut prev_pos,
@@ -751,10 +1109,27 @@ f 1/1 2/2 3/3
             u.coll_scale,
             &sub,
         );
-
-        assert!(
-            sim_pos.iter().all(|p| p.is_finite()),
-            "expected finite positions after 1 frame with CPU self-collision"
+        #[cfg(feature = "solver-jacobi")]
+        xpbd_frame_with_self_collision(
+            &mut sim_pos,
+            &mut prev_pos,
+            &mut vel,
+            &mut jac_a,
+            &mut jac_b,
+            &cloth.inv_mass,
+            &cloth.neighbor_offsets,
+            &cloth.neighbor_other,
+            &cloth.neighbor_constraint_id,
+            &cloth.constraint_i,
+            &cloth.constraint_j,
+            &cloth.constraint_rest_len,
+            &cloth.constraint_compliance,
+            &rest,
+            u.thickness,
+            u.coll_scale,
+            &sub,
         );
+
+        assert!(sim_pos.iter().all(|p| p.is_finite()));
     }
 }

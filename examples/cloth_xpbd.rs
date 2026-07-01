@@ -1,7 +1,7 @@
 //! XPBD cloth example: GPU simulation + extended PBR + mouse grab.
 //!
-//! Procedural rectangular sheet from [`bevy_xpbd::mesh_prep::grid_cloth_hanging`] (high resolution,
-//! pinned top row).
+//! Default build uses **parallel Jacobi** (`solver-jacobi`). For **colored Gauss–Seidel**:
+//! `cargo run --example cloth_xpbd --no-default-features --features solver-gauss-seidel`.
 
 use bevy::pbr::StandardMaterial;
 use bevy::render::storage::ShaderBuffer;
@@ -39,6 +39,7 @@ struct GrabState {
 #[derive(Resource)]
 struct ClothPickMesh {
     local_rest: Vec<Vec3>,
+    inv_mass: Vec<f32>,
 }
 
 fn main() {
@@ -74,11 +75,17 @@ fn setup(
         u.num_tris = config.num_tris;
         u.thickness = THICKNESS;
         u.coll_scale = DEFAULT_COLL_SCALE;
+        // Jacobi defaults are softer; keep example grab gentle under corner stress.
+        u.grab_stiffness = 0.25;
     }
 
     commands.insert_resource(ClothSimConfig {
         // Higher particle count (~12k vs ~475) benefits from somewhat more solver work than the prior demo tuning.
         solve_substeps: 24,
+        // Jacobi converges slower per iteration than colored GS — use more inner iters (library default is 22).
+        #[cfg(feature = "solver-jacobi")]
+        solve_inner_iterations: 20,
+        #[cfg(feature = "solver-gauss-seidel")]
         solve_inner_iterations: 8,
         // Halves pairwise self-collision work when `coll_scale > 0` (runs on odd-indexed substeps).
         collision_every_n_substeps: 4,
@@ -89,6 +96,7 @@ fn setup(
 
     commands.insert_resource(ClothPickMesh {
         local_rest: cloth.positions.clone(),
+        inv_mass: cloth.inv_mass.clone(),
     });
 
     let mesh = cloth.to_bevy_mesh();
@@ -167,7 +175,7 @@ fn mouse_grab(
     let ld = inv.transform_vector3(rd).normalize();
 
     if buttons.just_pressed(MouseButton::Left) {
-        if let Some((idx, t_hit)) = pick_closest_vertex(lo, ld, &pick.local_rest) {
+        if let Some((idx, t_hit)) = pick_closest_vertex(lo, ld, &pick.local_rest, &pick.inv_mass) {
             grab.active = true;
             grab.particle = idx as i32;
             grab.ray_t = t_hit;
@@ -188,7 +196,12 @@ fn mouse_grab(
     }
 }
 
-fn pick_closest_vertex(origin: Vec3, dir: Vec3, pts: &[Vec3]) -> Option<(usize, f32)> {
+fn pick_closest_vertex(
+    origin: Vec3,
+    dir: Vec3,
+    pts: &[Vec3],
+    inv_mass: &[f32],
+) -> Option<(usize, f32)> {
     let d2_line = |p: Vec3| {
         let t = (p - origin).dot(dir) / dir.dot(dir).max(1e-9);
         (t, (origin + dir * t - p).length_squared())
@@ -197,6 +210,9 @@ fn pick_closest_vertex(origin: Vec3, dir: Vec3, pts: &[Vec3]) -> Option<(usize, 
     let mut best_t = 0.0_f32;
     let mut best_d2 = f32::MAX;
     for (i, p) in pts.iter().enumerate() {
+        if inv_mass.get(i).copied().unwrap_or(0.0) <= 0.0 {
+            continue;
+        }
         let (t, err2) = d2_line(*p);
         if t < 0.0 {
             continue;

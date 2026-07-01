@@ -11,6 +11,11 @@ path = "src/lib.rs"
 name = "cloth_xpbd"
 path = "examples/cloth_xpbd.rs"
 
+[features]
+default = ["solver-jacobi"]
+solver-gauss-seidel = []
+solver-jacobi = []
+
 [dependencies]
 bevy = "0.19.0"
 bytemuck = { version = "1.22", features = ["derive"] }

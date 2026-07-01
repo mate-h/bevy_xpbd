@@ -9,7 +9,6 @@ struct SimParams {
     inner_iterations: u32,
     thickness: f32,
     coll_scale: f32,
-    /// Aligns **`gravity`** to 16 bytes (matches Rust `ClothSimParamsGpu`).
     _pad_before_gravity: vec2<f32>,
     gravity: vec4<f32>,
     grab_target: vec4<f32>,
@@ -18,7 +17,6 @@ struct SimParams {
     grab_stiffness: f32,
     floor_y: f32,
     linear_drag_per_sec: f32,
-    // Unused (legacy layout); real batch index is binding(19) dynamic uniform `gs_dyn_batch`.
     constraint_batch_idx: u32,
     _uniform_pad_vec2_u: vec2<u32>,
     _uniform_pad_vec2_f: vec2<f32>,
@@ -27,30 +25,25 @@ struct SimParams {
 
 @group(0) @binding(0) var<uniform> params: SimParams;
 @group(0) @binding(1) var<storage, read_write> sim_pos: array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read_write> jac_state: array<vec4<f32>>;
-@group(0) @binding(3) var<storage, read_write> prev_pos: array<vec4<f32>>;
-@group(0) @binding(4) var<storage, read_write> velocities: array<vec4<f32>>;
-@group(0) @binding(5) var<storage, read> rest_pos: array<vec4<f32>>;
-@group(0) @binding(6) var<storage, read> inv_mass: array<f32>;
-@group(0) @binding(7) var<storage, read> constraint_batch_offsets: array<u32>;
-@group(0) @binding(8) var<storage, read> constraint_i: array<u32>;
-@group(0) @binding(9) var<storage, read> constraint_j: array<u32>;
-@group(0) @binding(10) var<storage, read> constraint_rest: array<f32>;
-@group(0) @binding(11) var<storage, read> constraint_comp: array<f32>;
-@group(0) @binding(12) var<storage, read_write> constraint_lambda: array<f32>;
-@group(0) @binding(13) var<storage, read_write> constraint_delta_lambda: array<f32>;
-@group(0) @binding(14) var<storage, read> tri_indices: array<u32>;
-@group(0) @binding(15) var<storage, read_write> render_positions: array<vec4<f32>>;
-@group(0) @binding(16) var<storage, read_write> render_normals: array<vec4<f32>>;
-@group(0) @binding(17) var<storage, read_write> atomic_coll: array<atomic<i32>>;
-@group(0) @binding(18) var<storage, read_write> atomic_norm: array<atomic<i32>>;
-/// One 256‑byte dynamic slot (`min_uniform_buffer_offset_alignment`). `head.x` holds the batch index.
-/// `array<u32>` padding is invalid in uniform address space (stride must be ≥16).
-struct GsDynBatchUniform {
-    head: vec4<u32>,
-    _pad_bulk: array<vec4<u32>, 15>,
-}
-@group(0) @binding(19) var<uniform> gs_dyn_batch: GsDynBatchUniform;
+@group(0) @binding(2) var<storage, read> jac_in: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> jac_out: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read_write> prev_pos: array<vec4<f32>>;
+@group(0) @binding(5) var<storage, read_write> velocities: array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read> rest_pos: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read> inv_mass: array<f32>;
+@group(0) @binding(8) var<storage, read> neighbor_offsets: array<u32>;
+@group(0) @binding(9) var<storage, read> neighbor_packed: array<vec4<f32>>;
+@group(0) @binding(10) var<storage, read> constraint_i: array<u32>;
+@group(0) @binding(11) var<storage, read> constraint_j: array<u32>;
+@group(0) @binding(12) var<storage, read> constraint_rest: array<f32>;
+@group(0) @binding(13) var<storage, read> constraint_comp: array<f32>;
+@group(0) @binding(14) var<storage, read_write> constraint_lambda: array<f32>;
+@group(0) @binding(15) var<storage, read_write> constraint_delta_lambda: array<f32>;
+@group(0) @binding(16) var<storage, read> tri_indices: array<u32>;
+@group(0) @binding(17) var<storage, read_write> render_positions: array<vec4<f32>>;
+@group(0) @binding(18) var<storage, read_write> render_normals: array<vec4<f32>>;
+@group(0) @binding(19) var<storage, read_write> atomic_coll: array<atomic<i32>>;
+@group(0) @binding(20) var<storage, read_write> atomic_norm: array<atomic<i32>>;
 
 struct CollGridUniform {
     grid_origin_pad: vec4<f32>,
@@ -68,34 +61,32 @@ struct CollRadixPassUniform {
     data: vec4<u32>,
 }
 
-@group(0) @binding(20) var<uniform> coll_grid_u: CollGridUniform;
-@group(0) @binding(21) var<uniform> coll_radix_pass_u: CollRadixPassUniform;
-// 256-bucket radix; counts then exclusive bases written into radix_head before atomicAdd scatter.
-@group(0) @binding(22) var<storage, read_write> coll_radix_hist: array<atomic<u32>, 256>;
-@group(0) @binding(23) var<storage, read_write> coll_radix_head: array<atomic<u32>, 256>;
-@group(0) @binding(24) var<storage, read_write> coll_perm_ping: array<u32>;
-@group(0) @binding(25) var<storage, read_write> coll_perm_pong: array<u32>;
-@group(0) @binding(26) var<storage, read_write> coll_cell_start: array<atomic<u32>>;
-@group(0) @binding(27) var<storage, read_write> coll_cell_end_exclusive: array<atomic<u32>>;
+@group(0) @binding(21) var<uniform> coll_grid_u: CollGridUniform;
+@group(0) @binding(22) var<uniform> coll_radix_pass_u: CollRadixPassUniform;
+@group(0) @binding(23) var<storage, read_write> coll_radix_hist: array<atomic<u32>, 256>;
+@group(0) @binding(24) var<storage, read_write> coll_radix_head: array<atomic<u32>, 256>;
+@group(0) @binding(25) var<storage, read_write> coll_perm_ping: array<u32>;
+@group(0) @binding(26) var<storage, read_write> coll_perm_pong: array<u32>;
+@group(0) @binding(27) var<storage, read_write> coll_cell_start: array<atomic<u32>>;
+@group(0) @binding(28) var<storage, read_write> coll_cell_end_exclusive: array<atomic<u32>>;
 
 const FIXSCALE: i32 = 10000;
-/// Match `JACOBI_CORRECTION_CAP` in `cloth_compute.rs` (applied per particle per edge correction).
-const GS_CORRECTION_CAP: f32 = 0.28;
+const JACOBI_CORRECTION_CAP: f32 = 0.28;
 const GRAB_MAX_PULL: f32 = 0.065;
 
 fn clamp_delta_vec(dx: vec3<f32>) -> vec3<f32> {
     let ml = length(dx);
-    if (ml > GS_CORRECTION_CAP && ml > 0.0) {
-        return dx * (GS_CORRECTION_CAP / ml);
+    if (ml > JACOBI_CORRECTION_CAP && ml > 0.0) {
+        return dx * (JACOBI_CORRECTION_CAP / ml);
     }
     return dx;
 }
 
-fn xpbd_predict_then_write_jac_row(i: u32) {
+fn xpbd_predict_then_write_jac_out_row(i: u32) {
     let w = inv_mass[i];
     if (w <= 0.0) {
         prev_pos[i] = sim_pos[i];
-        jac_state[i] = sim_pos[i];
+        jac_out[i] = sim_pos[i];
         return;
     }
     var v = velocities[i].xyz;
@@ -120,17 +111,16 @@ fn xpbd_predict_then_write_jac_row(i: u32) {
     }
     sim_pos[i] = vec4<f32>(p, 0.0);
     velocities[i] = vec4<f32>(v, 0.0);
-    jac_state[i] = sim_pos[i];
+    jac_out[i] = sim_pos[i];
 }
 
-/// Gravity / floor / grab integration, then copy **`sim_pos` → `jac_state`** so GS reads fresh positions in one barrier.
 @compute @workgroup_size(64, 1, 1)
 fn predict_copy_sim_to_jac(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= params.num_particles) {
         return;
     }
-    xpbd_predict_then_write_jac_row(i);
+    xpbd_predict_then_write_jac_out_row(i);
 }
 
 @compute @workgroup_size(64, 1, 1)
@@ -139,10 +129,9 @@ fn copy_jac_to_sim(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.num_particles) {
         return;
     }
-    sim_pos[i] = jac_state[i];
+    sim_pos[i] = jac_in[i];
 }
 
-// Zero λ before each GS inner iteration.
 @compute @workgroup_size(64, 1, 1)
 fn clear_constraint_lambda(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -154,20 +143,13 @@ fn clear_constraint_lambda(@builtin(global_invocation_id) gid: vec3<u32>) {
     constraint_delta_lambda[i] = 0.0;
 }
 
-// XPBD distance constraints for one GS color batch; `gs_dyn_batch.head.x` via dynamic uniform offset.
-@compute @workgroup_size(128, 1, 1)
-fn gs_edges(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let b = gs_dyn_batch.head.x;
-    if (params.constraint_batch_count == 0u || b >= params.constraint_batch_count) {
+@compute @workgroup_size(64, 1, 1)
+fn jacobi_edges(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let e = gid.x;
+    let nc = arrayLength(&constraint_i);
+    if (e >= nc) {
         return;
     }
-    let start = constraint_batch_offsets[b];
-    let end = constraint_batch_offsets[b + 1u];
-    let e = gid.x + start;
-    if (e >= end) {
-        return;
-    }
-
     let i = constraint_i[e];
     let j = constraint_j[e];
     let w_i = inv_mass[i];
@@ -178,8 +160,8 @@ fn gs_edges(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let rest = constraint_rest[e];
     let compliance = constraint_comp[e];
-    let p_i = jac_state[i].xyz;
-    let p_j = jac_state[j].xyz;
+    let p_i = jac_in[i].xyz;
+    let p_j = jac_in[j].xyz;
     var gv = p_i - p_j;
     let len = length(gv);
     if (len < 1e-8) {
@@ -198,18 +180,44 @@ fn gs_edges(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dlam = (-C - alpha_t * lambda_e) / wsum;
     constraint_delta_lambda[e] = dlam;
     constraint_lambda[e] = lambda_e + dlam;
+}
 
-    let omega = params.jacobi_omega;
-    var dx_i = omega * gv * w_i * dlam;
-    var dx_j = -(omega * gv * w_j * dlam);
-    dx_i = clamp_delta_vec(dx_i);
-    dx_j = clamp_delta_vec(dx_j);
-    if (w_i > 0.0) {
-        jac_state[i] = vec4<f32>(p_i + dx_i, 0.0);
+@compute @workgroup_size(64, 1, 1)
+fn jacobi_gather(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.num_particles) {
+        return;
     }
-    if (w_j > 0.0) {
-        jac_state[j] = vec4<f32>(p_j + dx_j, 0.0);
+    let w_i = inv_mass[i];
+    if (w_i <= 0.0) {
+        jac_out[i] = jac_in[i];
+        return;
     }
+    let p_i = jac_in[i].xyz;
+    var acc = vec3<f32>(0.0);
+    let start = neighbor_offsets[i];
+    let end = neighbor_offsets[i + 1u];
+    for (var k = start; k < end; k++) {
+        let pack = neighbor_packed[k];
+        let j = u32(pack.x);
+        let w_j = inv_mass[j];
+        if (w_j <= 0.0 && w_i <= 0.0) {
+            continue;
+        }
+        let p_j = jac_in[j].xyz;
+        var gv = p_i - p_j;
+        let len = length(gv);
+        if (len < 1e-8) {
+            continue;
+        }
+        gv = gv / len;
+        let eid = u32(pack.w);
+        let dlam = constraint_delta_lambda[eid];
+        acc = acc + gv * w_i * dlam;
+    }
+    var delta = params.jacobi_omega * acc;
+    delta = clamp_delta_vec(delta);
+    jac_out[i] = vec4<f32>(p_i + delta, 0.0);
 }
 
 @compute @workgroup_size(64, 1, 1)
@@ -349,7 +357,6 @@ fn coll_radix_digit_scatter(@builtin(global_invocation_id) gid: vec3<u32>) {
     perm_dst_write(tgt, pj);
 }
 
-/// Parallel segmentation of radix-sorted permutation: each **[i]** participates if run start/end differs from neighbor flat cell ids.
 fn sorted_perm_cell_flat(i: u32) -> u32 {
     let pj = perm_final_read(i);
     return collision_flat_packed(sim_pos[pj].xyz);
