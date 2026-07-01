@@ -39,8 +39,8 @@ Neighbor lists (**`neighbor_offsets`**, **`neighbor_other`**, **`neighbor_constr
 
 | Area | Location |
 |------|----------|
-| Inner‑loop λ clear + **`gs_edges`** (**`cloth_pass_distance_gauss_seidel`**) | `src/cloth_compute.rs` — `ClothSimNode` |
-| Solve budget + fuse **`predict_copy_sim_to_jac`** + collision stride | `src/cloth_compute.rs` — `ClothSimConfig`, `ClothSimNode`; `assets/shaders/cloth_sim.wgsl` |
+| Inner‑loop λ clear + **`gs_edges`** (**`cloth_pass_distance_gauss_seidel`**) | `src/cloth_compute.rs` — `run_cloth_sim` |
+| Solve budget + fuse **`predict_copy_sim_to_jac`** + collision stride | `src/cloth_compute.rs` — `ClothSimConfig`, `run_cloth_sim`; `assets/shaders/cloth_sim.wgsl` |
 | GS kernel | `assets/shaders/cloth_sim.wgsl` — `gs_edges` |
 | Inner‑loop λ clear + GS sweep (CPU) | `src/xpbd_cpu.rs` — `xpbd_substep_integrate` |
 | Constraint coloring + offsets | `src/mesh_prep.rs` — `partition_constraints_for_gs_batches`, `constraint_batch_offsets` |

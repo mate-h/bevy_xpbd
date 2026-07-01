@@ -8,8 +8,8 @@ use bevy::math::{Vec3, Vec4};
 
 use crate::cloth_compute::{
     ClothCollGridGpu, ClothCollRadixPassGpu, ClothSimParamsGpu, ClothSimUniforms,
-    REFERENCE_FRAME_DELTA_SECS,
-    GS_BATCH_DYNAMIC_STRIDE, GS_EDGE_THREADS, INNER_ITERS, SUBSTEPS, THICKNESS,
+    GS_BATCH_DYNAMIC_STRIDE, GS_EDGE_THREADS, INNER_ITERS, REFERENCE_FRAME_DELTA_SECS, SUBSTEPS,
+    THICKNESS,
 };
 use crate::mesh_prep::ClothMeshData;
 use crate::xpbd_cpu::{xpbd_substep_with_self_collision, XpbdCpuTimeStepParams};
@@ -58,7 +58,8 @@ impl WgpuClothContext {
         }))
         .ok()?;
 
-        let shader_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/shaders/cloth_sim.wgsl");
+        let shader_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/shaders/cloth_sim.wgsl");
         let source = std::fs::read_to_string(&shader_path).ok()?;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cloth_sim"),
@@ -107,14 +108,8 @@ impl WgpuClothContext {
                     },
                     count: None,
                 },
-                uniform_fixed_entry(
-                    20,
-                    std::mem::size_of::<ClothCollGridGpu>() as u64,
-                ),
-                uniform_fixed_entry(
-                    21,
-                    std::mem::size_of::<ClothCollRadixPassGpu>() as u64,
-                ),
+                uniform_fixed_entry(20, std::mem::size_of::<ClothCollGridGpu>() as u64),
+                uniform_fixed_entry(21, std::mem::size_of::<ClothCollRadixPassGpu>() as u64),
                 storage_sized_entry(22, false, 256 * 4),
                 storage_sized_entry(23, false, 256 * 4),
                 storage_entry(24, false),
@@ -126,8 +121,8 @@ impl WgpuClothContext {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("cloth_pipeline_layout"),
-            bind_group_layouts: &[&bind_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_layout)],
+            immediate_size: 0,
         });
 
         macro_rules! cp {
@@ -280,7 +275,8 @@ fn make_buffers(ctx: &WgpuClothContext, mesh: &ClothMeshData) -> Buffers {
     ctx.queue.write_buffer(&sim_pos, 0, ip);
     ctx.queue.write_buffer(&jac_state, 0, ip);
     ctx.queue.write_buffer(&prev, 0, ip);
-    ctx.queue.write_buffer(&rest, 0, bytemuck::cast_slice::<Vec4, u8>(&rest_pos));
+    ctx.queue
+        .write_buffer(&rest, 0, bytemuck::cast_slice::<Vec4, u8>(&rest_pos));
     ctx.queue
         .write_buffer(&vel, 0, &vec![0u8; vec4_buf(n) as usize]);
     ctx.queue.write_buffer(
@@ -382,16 +378,10 @@ fn make_buffers(ctx: &WgpuClothContext, mesh: &ClothMeshData) -> Buffers {
             bytemuck::cast_slice::<f32, u8>(&mesh.constraint_compliance),
         );
     }
-    ctx.queue.write_buffer(
-        &constraint_lambda,
-        0,
-        &vec![0u8; ec_store * 4],
-    );
-    ctx.queue.write_buffer(
-        &constraint_delta_lambda,
-        0,
-        &vec![0u8; ec_store * 4],
-    );
+    ctx.queue
+        .write_buffer(&constraint_lambda, 0, &vec![0u8; ec_store * 4]);
+    ctx.queue
+        .write_buffer(&constraint_delta_lambda, 0, &vec![0u8; ec_store * 4]);
 
     let tri = dev.create_buffer(&wgpu::BufferDescriptor {
         label: Some("cloth_tri_indices"),
@@ -399,19 +389,15 @@ fn make_buffers(ctx: &WgpuClothContext, mesh: &ClothMeshData) -> Buffers {
         usage,
         mapped_at_creation: false,
     });
-    ctx.queue.write_buffer(
-        &tri,
-        0,
-        bytemuck::cast_slice::<u32, u8>(&mesh.indices),
-    );
+    ctx.queue
+        .write_buffer(&tri, 0, bytemuck::cast_slice::<u32, u8>(&mesh.indices));
 
     let n3 = (n * 3 * 4) as u64;
     let atomic_coll = vb("cloth_atomic_coll", n3);
     let atomic_norm = vb("cloth_atomic_norm", n3);
 
     let nb_lut = mesh.constraint_batch_count.max(1) as usize;
-    let gs_dyn_bytes =
-        GS_BATCH_DYNAMIC_STRIDE as usize * nb_lut;
+    let gs_dyn_bytes = GS_BATCH_DYNAMIC_STRIDE as usize * nb_lut;
     let mut gs_dyn_lut = vec![0u8; gs_dyn_bytes];
     for bat in 0..(mesh.constraint_batch_count as usize) {
         let o = bat * GS_BATCH_DYNAMIC_STRIDE as usize;
@@ -425,13 +411,8 @@ fn make_buffers(ctx: &WgpuClothContext, mesh: &ClothMeshData) -> Buffers {
     });
     ctx.queue.write_buffer(&gs_batch_dyn, 0, &gs_dyn_lut);
 
-    let (
-        grid_origin,
-        coll_inv_cell,
-        coll_dims,
-        coll_nc,
-        coll_rd,
-    ) = crate::mesh_prep::derive_collision_grid(&rest_pos, THICKNESS);
+    let (grid_origin, coll_inv_cell, coll_dims, coll_nc, coll_rd) =
+        crate::mesh_prep::derive_collision_grid(&rest_pos, THICKNESS);
     let coll_num_cells_meta = coll_nc.max(1);
     let coll_radix_digits_meta = coll_rd.max(1);
     let nc_usize = coll_num_cells_meta as usize;
@@ -454,11 +435,8 @@ fn make_buffers(ctx: &WgpuClothContext, mesh: &ClothMeshData) -> Buffers {
         _align_pad: [0u8; 4],
         _reserved: [0u32; 4],
     };
-    ctx.queue.write_buffer(
-        &coll_grid_uniform,
-        0,
-        bytemuck::bytes_of(&gpu_grid),
-    );
+    ctx.queue
+        .write_buffer(&coll_grid_uniform, 0, bytemuck::bytes_of(&gpu_grid));
 
     let coll_radix_pass_uniform = dev.create_buffer(&wgpu::BufferDescriptor {
         label: Some("cloth_coll_radix_pass_uniform"),
@@ -732,14 +710,9 @@ fn run_one_gpu_substep(
     }
 
     for d in 0..radix_digits {
-        let radix_u = ClothCollRadixPassGpu {
-            data: [d, 0, 0, 0],
-        };
-        ctx.queue.write_buffer(
-            &b.coll_radix_pass_uniform,
-            0,
-            bytemuck::bytes_of(&radix_u),
-        );
+        let radix_u = ClothCollRadixPassGpu { data: [d, 0, 0, 0] };
+        ctx.queue
+            .write_buffer(&b.coll_radix_pass_uniform, 0, bytemuck::bytes_of(&radix_u));
 
         let mut rpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("cloth_pass_collision_radix"),
@@ -825,9 +798,7 @@ fn read_vec4_positions(ctx: &WgpuClothContext, buf: &wgpu::Buffer, n: usize) -> 
     let flat: Vec<Vec4> = bytemuck::cast_slice(&data).to_vec();
     drop(data);
     staging.unmap();
-    flat.into_iter()
-        .map(|v| Vec3::new(v.x, v.y, v.z))
-        .collect()
+    flat.into_iter().map(|v| Vec3::new(v.x, v.y, v.z)).collect()
 }
 
 fn triangle_cloth() -> ClothMeshData {
@@ -850,9 +821,9 @@ mod tests {
 
     #[test]
     fn gpu_cpu_one_substep_single_triangle_positions_close() {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let ctx = WgpuClothContext::new(&instance)
             .expect("GPU adapter + cloth_sim.wgsl load required for parity test");
@@ -940,9 +911,9 @@ mod tests {
 
     #[test]
     fn gpu_cpu_grid_cloth_substep_positions_close() {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let ctx = WgpuClothContext::new(&instance)
             .expect("GPU adapter + cloth_sim.wgsl load required for parity test");

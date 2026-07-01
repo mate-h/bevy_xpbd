@@ -1,4 +1,4 @@
-//! GPU XPBD cloth simulation with Bevy 0.18 (WebGPU via wgpu).
+//! GPU XPBD cloth simulation with Bevy 0.19 (WebGPU via wgpu).
 
 pub mod cloth_compute;
 pub mod cloth_material;

@@ -3,15 +3,18 @@
 //! Procedural rectangular sheet from [`bevy_xpbd::mesh_prep::grid_cloth_hanging`] (high resolution,
 //! pinned top row).
 
-use bevy::{color::LinearRgba, input::keyboard::KeyCode, input::mouse::MouseButton, pbr::ExtendedMaterial, prelude::*};
 use bevy::pbr::StandardMaterial;
-use bevy::render::storage::ShaderStorageBuffer;
+use bevy::render::storage::ShaderBuffer;
+use bevy::{
+    color::LinearRgba, input::keyboard::KeyCode, input::mouse::MouseButton, pbr::ExtendedMaterial,
+    prelude::*,
+};
 use bevy_xpbd::{
     cloth_compute::{
         ClothComputePlugin, ClothSimConfig, ClothSimControl, ClothSimUniforms, DEFAULT_COLL_SCALE,
         THICKNESS,
     },
-    cloth_material::{ClothMaterialPlugin, ClothMatExt},
+    cloth_material::{ClothMatExt, ClothMaterialPlugin},
     mesh_prep::{grid_cloth_hanging, ClothMeshData},
 };
 
@@ -59,7 +62,7 @@ fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ExtendedMaterial<StandardMaterial, ClothMatExt>>>,
-    mut buffers: ResMut<Assets<ShaderStorageBuffer>>,
+    mut buffers: ResMut<Assets<ShaderBuffer>>,
     mut uniforms: ResMut<ClothSimUniforms>,
 ) {
     let cloth = procedural_cloth();

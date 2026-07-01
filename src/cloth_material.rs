@@ -1,13 +1,10 @@
-//! Extended PBR material: displaces vertices from GPU simulation `ShaderStorageBuffer`s.
+//! Extended PBR material: displaces vertices from GPU simulation `ShaderBuffer`s.
 
 use bevy::{
     pbr::{ExtendedMaterial, MaterialExtension},
     prelude::*,
     reflect::TypePath,
-    render::{
-        render_resource::AsBindGroup,
-        storage::{ShaderStorageBuffer},
-    },
+    render::{render_resource::AsBindGroup, storage::ShaderBuffer},
     shader::ShaderRef,
 };
 
@@ -16,9 +13,9 @@ const CLOTH_MAT_WGSL: &str = "shaders/cloth_vertex.wgsl";
 #[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
 pub struct ClothMatExt {
     #[storage(101, read_only)]
-    pub sim_positions: Handle<ShaderStorageBuffer>,
+    pub sim_positions: Handle<ShaderBuffer>,
     #[storage(102, read_only)]
-    pub sim_normals: Handle<ShaderStorageBuffer>,
+    pub sim_normals: Handle<ShaderBuffer>,
 }
 
 impl MaterialExtension for ClothMatExt {
@@ -43,6 +40,8 @@ pub struct ClothMaterialPlugin;
 
 impl Plugin for ClothMaterialPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(MaterialPlugin::<ExtendedMaterial<StandardMaterial, ClothMatExt>>::default());
+        app.add_plugins(MaterialPlugin::<
+            ExtendedMaterial<StandardMaterial, ClothMatExt>,
+        >::default());
     }
 }

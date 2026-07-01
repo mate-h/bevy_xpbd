@@ -13,15 +13,12 @@ pub const COLLISION_GRID_MAX_AXIS: u32 = 96;
 
 /// BBox (`origin` = min corner) and cell quantization for **`collide_grid_cells`** (`cloth_sim.wgsl`).
 /// Returns `(origin, inv_cell_size, dims[gxyz], num_cells, radix_digits)` for sorting keys in `[0, num_cells)`.
-pub fn derive_collision_grid(rest_positions: &[Vec4], thickness: f32) -> (Vec3, f32, [u32; 3], u32, u32) {
+pub fn derive_collision_grid(
+    rest_positions: &[Vec4],
+    thickness: f32,
+) -> (Vec3, f32, [u32; 3], u32, u32) {
     if rest_positions.is_empty() {
-        return (
-            Vec3::ZERO,
-            1.0,
-            [1, 1, 1],
-            1,
-            1,
-        );
+        return (Vec3::ZERO, 1.0, [1, 1, 1], 1, 1);
     }
 
     let mut mn = Vec3::splat(f32::MAX);
@@ -159,11 +156,7 @@ fn dist(a: Vec3, b: Vec3) -> f32 {
 fn partition_constraints_for_gs_batches(
     n_particles: usize,
     constraints: Vec<(u32, u32, f32, f32)>,
-) -> (
-    Vec<(u32, u32, f32, f32)>,
-    Vec<u32>,
-    u32,
-) {
+) -> (Vec<(u32, u32, f32, f32)>, Vec<u32>, u32) {
     let e_count = constraints.len();
     if e_count == 0 {
         return (constraints, vec![0, 0], 0);
@@ -224,11 +217,7 @@ fn partition_constraints_for_gs_batches(
 
     let batch_count = (offs.len().saturating_sub(1)) as u32;
 
-    (
-        sorted_constraints,
-        offs,
-        batch_count,
-    )
+    (sorted_constraints, offs, batch_count)
 }
 
 pub fn parse_welded_obj(obj_text: &str) -> ClothMeshData {
@@ -306,10 +295,7 @@ pub fn parse_welded_obj(obj_text: &str) -> ClothMeshData {
             .map(|u| u.saturating_sub(1));
 
         positions.push(vec3_from_f32x3(
-            verts_pos
-                .get(vi)
-                .copied()
-                .unwrap_or([0.0, 0.0, 0.0]),
+            verts_pos.get(vi).copied().unwrap_or([0.0, 0.0, 0.0]),
         ));
         if let Some(ui) = uvi {
             let uv = verts_uv.get(ui).copied().unwrap_or([0.0, 0.0]);
@@ -319,10 +305,7 @@ pub fn parse_welded_obj(obj_text: &str) -> ClothMeshData {
         }
         if let Some(nix) = ni {
             normals.push(vec3_from_f32x3(
-                verts_nrm
-                    .get(nix)
-                    .copied()
-                    .unwrap_or([0.0, 1.0, 0.0]),
+                verts_nrm.get(nix).copied().unwrap_or([0.0, 1.0, 0.0]),
             ));
         } else {
             normals.push(Vec3::Y);
@@ -412,8 +395,7 @@ pub fn grid_cloth_hanging(quad_cols: u32, quad_rows: u32, cell_size: f32) -> Clo
             let i2 = i0 + cols;
             let i3 = i2 + 1;
             indices.extend_from_slice(&[
-                i0 as u32, i1 as u32, i2 as u32,
-                i1 as u32, i3 as u32, i2 as u32,
+                i0 as u32, i1 as u32, i2 as u32, i1 as u32, i3 as u32, i2 as u32,
             ]);
         }
     }
@@ -693,7 +675,7 @@ fn find_tri_neighbors(indices: &[u32]) -> Vec<u32> {
                 id0: id0.min(id1),
                 id1: id0.max(id1),
                 edge_nr: (3 * i as u32 + j),
- });
+            });
         }
     }
     edges.sort_by(|a, b| a.id0.cmp(&b.id0).then(a.id1.cmp(&b.id1)));
@@ -739,11 +721,7 @@ fn unique_edges_and_rests(
     out
 }
 
-fn bending_pairs(
-    indices: &[u32],
-    neighbors: &[u32],
-    positions: &[Vec3],
-) -> Vec<(u32, u32, f32)> {
+fn bending_pairs(indices: &[u32], neighbors: &[u32], positions: &[Vec3]) -> Vec<(u32, u32, f32)> {
     let num_tris = indices.len() / 3;
     let mut seen = HashMap::new();
     let mut out = Vec::new();
@@ -772,18 +750,16 @@ impl ClothMeshData {
     pub fn to_bevy_mesh(&self) -> bevy::mesh::Mesh {
         use bevy::asset::RenderAssetUsages;
         use bevy::mesh::{Mesh, PrimitiveTopology};
-        let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        );
         let pos: Vec<[f32; 3]> = self.positions.iter().map(|v| v.to_array()).collect();
         let nrm: Vec<[f32; 3]> = self.normals.iter().map(|v| v.to_array()).collect();
         let uv: Vec<[f32; 2]> = self.uvs.iter().map(|v| v.to_array()).collect();
         // UV1.x = particle id for `cloth_vertex.wgsl` when `VERTEX_UVS_B` is enabled (matches indexed draw).
-        let uv1: Vec<[f32; 2]> = (0..self.positions.len())
-            .map(|i| [i as f32, 0.0])
-            .collect();
-        mesh.insert_attribute(
-            bevy::mesh::Mesh::ATTRIBUTE_POSITION,
-            pos,
-        );
+        let uv1: Vec<[f32; 2]> = (0..self.positions.len()).map(|i| [i as f32, 0.0]).collect();
+        mesh.insert_attribute(bevy::mesh::Mesh::ATTRIBUTE_POSITION, pos);
         mesh.insert_attribute(bevy::mesh::Mesh::ATTRIBUTE_NORMAL, nrm);
         mesh.insert_attribute(bevy::mesh::Mesh::ATTRIBUTE_UV_0, uv);
         // Unused by `cloth_vertex.wgsl` (particle index comes from the index buffer + batch base vertex).

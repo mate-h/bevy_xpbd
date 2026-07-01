@@ -400,12 +400,7 @@ mod tests {
     fn cloth_mesh_inv_mass_and_neighbors_sane() {
         let cloth = cloth_test_grid();
         for (i, &w) in cloth.inv_mass.iter().enumerate() {
-            assert!(
-                w.is_finite(),
-                "inv_mass[{}] = {} (non-finite)",
-                i,
-                w
-            );
+            assert!(w.is_finite(), "inv_mass[{}] = {} (non-finite)", i, w);
         }
     }
 
@@ -707,7 +702,11 @@ f 1/1 2/2 3/3
         let pin = sim[0];
         self_collision_resolve(&mut sim, &inv_mass, &rest_pos, thickness, coll_scale);
         assert_eq!(sim[0], pin);
-        assert!(sim[1].x > 0.015, "free particle should separate: {:?}", sim[1]);
+        assert!(
+            sim[1].x > 0.015,
+            "free particle should separate: {:?}",
+            sim[1]
+        );
     }
 
     #[test]
