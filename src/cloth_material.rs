@@ -1,6 +1,7 @@
 //! Extended PBR material: displaces vertices from GPU simulation `ShaderBuffer`s.
 
 use bevy::{
+    asset::embedded_asset,
     pbr::{ExtendedMaterial, MaterialExtension},
     prelude::*,
     reflect::TypePath,
@@ -8,7 +9,7 @@ use bevy::{
     shader::ShaderRef,
 };
 
-const CLOTH_MAT_WGSL: &str = "shaders/cloth_vertex.wgsl";
+const CLOTH_MAT_WGSL: &str = "embedded://bevy_softbody/shaders/cloth_vertex.wgsl";
 
 #[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
 pub struct ClothMatExt {
@@ -40,6 +41,7 @@ pub struct ClothMaterialPlugin;
 
 impl Plugin for ClothMaterialPlugin {
     fn build(&self, app: &mut App) {
+        embedded_asset!(app, "shaders/cloth_vertex.wgsl");
         app.add_plugins(MaterialPlugin::<
             ExtendedMaterial<StandardMaterial, ClothMatExt>,
         >::default());

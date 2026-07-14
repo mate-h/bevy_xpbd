@@ -22,7 +22,7 @@
 //! **Note:** See **`docs/CLOTH_SIM_STABILITY.md`** for stability history.
 
 use bevy::{
-    asset::RenderAssetUsages,
+    asset::{embedded_asset, RenderAssetUsages},
     core_pipeline::schedule::camera_driver,
     prelude::*,
     reflect::Reflect,
@@ -49,11 +49,11 @@ use std::ops::Deref;
 use crate::mesh_prep::ClothMeshData;
 
 #[cfg(feature = "solver-gauss-seidel")]
-pub const CLOTH_SHADER: &str = "shaders/cloth_sim.wgsl";
+pub const CLOTH_SHADER: &str = "embedded://bevy_softbody/shaders/cloth_sim.wgsl";
 #[cfg(feature = "solver-jacobi")]
-pub const CLOTH_SHADER: &str = "shaders/cloth_sim_jacobi.wgsl";
+pub const CLOTH_SHADER: &str = "embedded://bevy_softbody/shaders/cloth_sim_jacobi.wgsl";
 #[cfg(feature = "solver-jacobi")]
-pub const CLOTH_SHADER_JACOBI: &str = "shaders/cloth_sim_jacobi.wgsl";
+pub const CLOTH_SHADER_JACOBI: &str = "embedded://bevy_softbody/shaders/cloth_sim_jacobi.wgsl";
 /// XPBD (Müller et al.): use enough substeps so constraint corrections stay well-behaved vs. `dt`.
 /// More substeps shrink substep `dt` → XPBD `α̃ = α/dt²` stays moderate and implicit integration is stabler.
 pub const SUBSTEPS: u32 = 36;
@@ -444,6 +444,11 @@ pub struct ClothComputePlugin;
 
 impl Plugin for ClothComputePlugin {
     fn build(&self, app: &mut App) {
+        #[cfg(feature = "solver-gauss-seidel")]
+        embedded_asset!(app, "shaders/cloth_sim.wgsl");
+        #[cfg(feature = "solver-jacobi")]
+        embedded_asset!(app, "shaders/cloth_sim_jacobi.wgsl");
+
         app.init_resource::<ClothSimControl>();
         app.init_resource::<ClothSimFrameTiming>();
         app.add_systems(

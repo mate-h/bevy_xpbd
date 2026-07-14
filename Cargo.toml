@@ -3,6 +3,19 @@ name = "bevy_softbody"
 version = "0.1.0"
 edition = "2021"
 description = "GPU XPBD cloth with Bevy 0.19 (wgpu/WebGPU)"
+license = "MIT"
+authors = ["Máté Homolya <mate.homolya@gmail.com>"]
+repository = "https://github.com/mate-h/bevy_softbody"
+homepage = "https://github.com/mate-h/bevy_softbody"
+readme = "README.md"
+keywords = ["bevy", "cloth", "softbody", "xpbd", "gpu"]
+categories = ["game-development", "graphics"]
+include = [
+    "src/**/*",
+    "LICENSE",
+    "README.md",
+    "Cargo.toml",
+]
 
 [lib]
 path = "src/lib.rs"

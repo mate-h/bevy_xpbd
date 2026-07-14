@@ -23,7 +23,7 @@ XPBD uses a Lagrange multiplier λ per constraint (see Macklin et al., Eq. 17–
 
 The simulation buffers could stay sane while the mesh looked like a **tiny ball**: every vertex was sampling the **same** slot in `sim_positions` (often index `0`).
 
-**Fix (vertex shader, `assets/shaders/cloth_vertex.wgsl`):**
+**Fix (vertex shader, `src/shaders/cloth_vertex.wgsl`):**
 
 - Prefer **`vi = u32(vertex.uv_b.x + 0.5)`** when `VERTEX_UVS_B` is defined. The procedural mesh sets **`ATTRIBUTE_UV_1`** so `uv_b.x` is the particle index (see `ClothMeshData::to_bevy_mesh`).
 - Otherwise fall back to **`vertex_index - mesh[instance].first_vertex_index`**, which matches Bevy’s indexed `draw_indexed` base vertex for slab‑allocated meshes.
@@ -32,7 +32,7 @@ Without a reliable index, the GPU draws garbage positions while compute still up
 
 ## 3. CPU neighbor slices (mesh validation only)
 
-Neighbor lists (**`neighbor_offsets`**, **`neighbor_other`**, **`neighbor_constraint_id`**) remain on `ClothMeshData` for regression tests and tooling. The default **Jacobi** build uploads **`neighbor_offsets`** + **`neighbor_packed`** for **`jacobi_gather`** (`assets/shaders/cloth_sim_jacobi.wgsl`). With **`solver-gauss-seidel`**, neighbors stay CPU-only.
+Neighbor lists (**`neighbor_offsets`**, **`neighbor_other`**, **`neighbor_constraint_id`**) remain on `ClothMeshData` for regression tests and tooling. The default **Jacobi** build uploads **`neighbor_offsets`** + **`neighbor_packed`** for **`jacobi_gather`** (`src/shaders/cloth_sim_jacobi.wgsl`). With **`solver-gauss-seidel`**, neighbors stay CPU-only.
 
 **Invariant:** Built with **cursor‑based scatter** in `finalize_cloth_mesh` (`mesh_prep.rs`), aligned with batch-sorted constraint order.
 
@@ -59,12 +59,12 @@ Both paths **clear λ before each inner iteration** (stability rule from §1). J
 |------|----------|
 | Inner‑loop λ clear + **`gs_edges`** (**`cloth_pass_distance_gauss_seidel`**) | `src/cloth_compute.rs` — `run_cloth_sim` (GS feature) |
 | Jacobi inner loop (**`cloth_pass_distance_jacobi`**) | `src/cloth_jacobi.rs` — `run_cloth_sim_jacobi` (`solver-jacobi` feature) |
-| Solve budget + fuse **`predict_copy_sim_to_jac`** + collision stride | `src/cloth_compute.rs` — `ClothSimConfig`, `run_cloth_sim`; `assets/shaders/cloth_sim.wgsl` |
-| GS kernel | `assets/shaders/cloth_sim.wgsl` — `gs_edges` |
+| Solve budget + fuse **`predict_copy_sim_to_jac`** + collision stride | `src/cloth_compute.rs` — `ClothSimConfig`, `run_cloth_sim`; `src/shaders/cloth_sim.wgsl` |
+| GS kernel | `src/shaders/cloth_sim.wgsl` — `gs_edges` |
 | Inner‑loop λ clear + GS sweep (CPU) | `src/xpbd_cpu.rs` — `xpbd_substep_integrate` |
 | Constraint coloring + offsets | `src/mesh_prep.rs` — `partition_constraints_for_gs_batches`, `constraint_batch_offsets` |
 | Parity harness | `src/gpu_cpu_parity.rs` |
-| Vertex particle index | `assets/shaders/cloth_vertex.wgsl` |
+| Vertex particle index | `src/shaders/cloth_vertex.wgsl` |
 | Neighbor scatter + compliance defaults | `src/mesh_prep.rs` |
 | Quad cross-diagonal (shear / zipper fix) | `src/mesh_prep.rs` — `DEFAULT_CROSS_DIAG_COMPLIANCE` |
 | Self-collision strength (`coll_scale`; `0` = off) | `src/cloth_compute.rs` — `DEFAULT_COLL_SCALE`, `ClothSimUniforms` |

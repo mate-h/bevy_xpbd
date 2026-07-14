@@ -58,8 +58,7 @@ impl WgpuClothContext {
         }))
         .ok()?;
 
-        let shader_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/shaders/cloth_sim.wgsl");
+        let shader_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders/cloth_sim.wgsl");
         let source = std::fs::read_to_string(&shader_path).ok()?;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cloth_sim"),
