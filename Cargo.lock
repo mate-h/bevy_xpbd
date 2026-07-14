@@ -1519,6 +1519,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy_softbody"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "bevy_egui",
+ "bytemuck",
+ "pollster",
+ "wgpu",
+]
+
+[[package]]
 name = "bevy_sprite"
 version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1864,17 +1875,6 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "uuid",
-]
-
-[[package]]
-name = "bevy_xpbd"
-version = "0.1.0"
-dependencies = [
- "bevy",
- "bevy_egui",
- "bytemuck",
- "pollster",
- "wgpu",
 ]
 
 [[package]]

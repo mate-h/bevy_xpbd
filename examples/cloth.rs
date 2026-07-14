@@ -13,7 +13,7 @@ use bevy::{
     prelude::*,
 };
 use bevy_egui::input::{egui_wants_any_keyboard_input, EguiWantsInput};
-use bevy_xpbd::{
+use bevy_softbody::{
     cloth_compute::{
         ClothComputePlugin, ClothSimConfig, ClothSimControl, ClothSimFrameTiming, ClothSimUniforms,
         DEFAULT_COLL_SCALE, THICKNESS,

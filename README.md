@@ -1,4 +1,4 @@
-# bevy_xpbd
+# bevy_softbody
 
 GPU cloth simulation for [Bevy](https://bevyengine.org/), using WebGPU compute shaders. Implements [XPBD](https://matthias-research.github.io/pages/publications/XPBD.pdf) (eXtended Position Based Dynamics; Macklin et al., 2016).
 

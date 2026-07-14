@@ -2,12 +2,12 @@
 
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts, EguiGlobalSettings, EguiPlugin, EguiPrimaryContextPass};
-use bevy_xpbd::cloth_compute::{
+use bevy_softbody::cloth_compute::{
     ClothSimConfig, ClothSimControl, ClothSimUniforms, DEFAULT_COLL_SCALE,
     DEFAULT_LINEAR_AIR_DRAG_PER_SEC, THICKNESS,
 };
 #[cfg(feature = "solver-jacobi")]
-use bevy_xpbd::cloth_jacobi::jacobi_default_omega;
+use bevy_softbody::cloth_jacobi::jacobi_default_omega;
 
 /// Rolling frame-time graph length (~2 s at 60 Hz).
 const FRAME_GRAPH_SAMPLES: usize = 120;

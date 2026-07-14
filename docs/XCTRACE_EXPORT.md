@@ -1,6 +1,6 @@
 # Exporting an Instruments trace with `xctrace`
 
-This note lives in the **bevy_xpbd** repo as a reference for Apple **Instruments** captures (e.g. **Metal System Trace**). It does **not** ship trace data: you export XML **from your `.trace` bundle** into that bundle’s own `exported/` folder (or any path you choose).
+This note lives in the **bevy_softbody** repo as a reference for Apple **Instruments** captures (e.g. **Metal System Trace**). It does **not** ship trace data: you export XML **from your `.trace` bundle** into that bundle’s own `exported/` folder (or any path you choose).
 
 An Instruments **`.trace`** file is usually a **package directory** (Show Package Contents in Finder). Pass that directory to `--input`—the extension may be `.trace` or omitted (e.g. `~/Desktop/trace`).
 

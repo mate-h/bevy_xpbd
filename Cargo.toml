@@ -1,5 +1,5 @@
 [package]
-name = "bevy_xpbd"
+name = "bevy_softbody"
 version = "0.1.0"
 edition = "2021"
 description = "GPU XPBD cloth with Bevy 0.19 (wgpu/WebGPU)"
