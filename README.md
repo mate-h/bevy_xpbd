@@ -2,7 +2,7 @@
 
 GPU cloth simulation for [Bevy](https://bevyengine.org/), using WebGPU compute shaders. Implements [XPBD](https://matthias-research.github.io/pages/publications/XPBD.pdf) (eXtended Position Based Dynamics; Macklin et al., 2016).
 
-![Cloth demo](assets/demo.png)
+![Cloth demo](assets/demo.jpg)
 
 ## Run the demo
 
