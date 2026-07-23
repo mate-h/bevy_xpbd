@@ -15,7 +15,7 @@ pub struct XpbdCpuTimeStepParams {
     pub inv_dt: f32,
     pub jacobi_omega: f32,
     pub inner_iterations: u32,
-    /// Gravity in `predict` (`v += gravity * dt`), matching `cloth_sim.wgsl` (`params.gravity.xyz`).
+    /// Gravity in `predict` (`v += gravity * dt`), matching GPU `params.gravity.xyz`.
     pub gravity: Vec3,
     pub grab_idx: i32,
     pub grab_active: bool,
@@ -24,6 +24,9 @@ pub struct XpbdCpuTimeStepParams {
     /// `dv/dt` drag coefficient [1/s] matching WGSL `post_velocity`: `v *= exp(-linear_drag_per_sec * dt_sub)`.
     pub linear_drag_per_sec: f32,
 }
+
+/// Matches `softbody_solver::types::EDGE_COMPRESS_MIN_FRAC` (anti-accordion / furl).
+const EDGE_COMPRESS_MIN_FRAC: f32 = 0.70;
 
 fn clamp_correction(dx: Vec3) -> Vec3 {
     let ml = dx.length();
@@ -35,6 +38,49 @@ fn clamp_correction(dx: Vec3) -> Vec3 {
     }
 }
 
+/// Macklin XPBD Δλ with a hard compression floor (mirrors GPU `xpbd_distance_delta_lambda`).
+fn xpbd_distance_delta_lambda(
+    len: f32,
+    rest: f32,
+    w_i: f32,
+    w_j: f32,
+    compliance: f32,
+    inv_dt_sq: f32,
+    lambda: f32,
+) -> f32 {
+    if len < 1e-8 || (w_i <= 0.0 && w_j <= 0.0) {
+        return 0.0;
+    }
+    let min_len = rest * EDGE_COMPRESS_MIN_FRAC;
+    if len < min_len {
+        let c = len - min_len;
+        let wsum = w_i + w_j;
+        if wsum < 1e-8 {
+            return 0.0;
+        }
+        return (-c) / wsum;
+    }
+    let c = len - rest;
+    let alpha_t = compliance * inv_dt_sq;
+    let wsum = w_i + w_j + alpha_t;
+    if wsum < 1e-8 {
+        return 0.0;
+    }
+    (-c - alpha_t * lambda) / wsum
+}
+
+fn is_grabbed(i: usize, p: &XpbdCpuTimeStepParams) -> bool {
+    p.grab_active && i as i32 == p.grab_idx
+}
+
+fn effective_inv_mass(i: usize, inv_mass: f32, p: &XpbdCpuTimeStepParams) -> f32 {
+    if is_grabbed(i, p) {
+        0.0
+    } else {
+        inv_mass
+    }
+}
+
 fn predict_particle(
     i: usize,
     sim: Vec3,
@@ -42,6 +88,15 @@ fn predict_particle(
     inv_mass: f32,
     p: &XpbdCpuTimeStepParams,
 ) -> (Vec3, Vec3) {
+    // Kinematic grab (matches GPU): soft-follow cursor; constraints see infinite mass.
+    if is_grabbed(i, p) {
+        let mut pull = (p.grab_target - sim) * p.grab_stiffness.clamp(0.0, 1.0);
+        let pl = pull.length();
+        if pl > GRAB_MAX_PULL_PER_SUBSTEP && pl > 0.0 {
+            pull *= GRAB_MAX_PULL_PER_SUBSTEP / pl;
+        }
+        return (sim + pull, vel);
+    }
     if inv_mass <= 0.0 {
         return (sim, vel);
     }
@@ -52,19 +107,60 @@ fn predict_particle(
     if speed > max_v && speed > 0.0 {
         v *= max_v / speed;
     }
-    let mut pos = sim + v * p.dt;
-    if p.grab_active && i as i32 == p.grab_idx {
-        let mut pull = (p.grab_target - pos) * p.grab_stiffness;
-        let pl = pull.length();
-        if pl > GRAB_MAX_PULL_PER_SUBSTEP && pl > 0.0 {
-            pull *= GRAB_MAX_PULL_PER_SUBSTEP / pl;
-        }
-        pos += pull;
-    }
-    (pos, v)
+    (sim + v * p.dt, v)
 }
 
-/// O(n²) self-collision pass matching the GPU narrow phase in **`collide_grid_cells`** + **`collide_apply`** (`cloth_sim.wgsl`).
+/// Pair separation matching GPU `self_collision_separation` (narrow phase).
+fn self_collision_separation(
+    thickness: f32,
+    coll_scale: f32,
+    p_i: Vec3,
+    p_j: Vec3,
+    rest_i: Vec3,
+    rest_j: Vec3,
+    w_i: f32,
+    w_j: f32,
+) -> (bool, Vec3, Vec3) {
+    let zero = Vec3::ZERO;
+    if coll_scale <= 0.0 || (w_i <= 0.0 && w_j <= 0.0) {
+        return (false, zero, zero);
+    }
+    let thickness_sq = thickness * thickness;
+    let mut d = p_j - p_i;
+    let dist2 = d.length_squared();
+    if dist2 > thickness_sq {
+        return (false, zero, zero);
+    }
+    let rest_d = rest_j - rest_i;
+    let rest_len = rest_d.length();
+    let local = rest_len < thickness * 1.35;
+    if local && dist2 > rest_len * rest_len {
+        return (false, zero, zero);
+    }
+    let min_d = if local {
+        rest_len.min(thickness)
+    } else {
+        thickness
+    };
+    let dist = if dist2 > 1e-18 { dist2.sqrt() } else { 0.0 };
+    let corr = (min_d - dist) * coll_scale;
+    if corr <= 0.0 {
+        return (false, zero, zero);
+    }
+    if dist < 1e-5 {
+        if rest_len > 1e-8 {
+            d = rest_d * (corr / rest_len);
+        } else {
+            d = Vec3::new(0.0, corr, 0.0);
+        }
+    } else {
+        d *= corr / dist;
+    }
+    let inv_w = 1.0 / (w_i + w_j).max(1e-8);
+    (true, -d * w_i * inv_w, d * w_j * inv_w)
+}
+
+/// O(n²) self-collision pass matching the GPU narrow phase in **`collide_grid_cells`** + **`collide_apply`**.
 pub fn self_collision_resolve(
     sim_pos: &mut [Vec3],
     inv_mass: &[f32],
@@ -75,44 +171,26 @@ pub fn self_collision_resolve(
     let n = sim_pos.len();
     debug_assert_eq!(inv_mass.len(), n);
     debug_assert_eq!(rest_pos.len(), n);
-    let thickness_sq = thickness * thickness;
 
     let mut accum = vec![Vec3::ZERO; n];
 
     for i in 0..n {
         for j in (i + 1)..n {
-            if inv_mass[i] <= 0.0 && inv_mass[j] <= 0.0 {
-                continue;
-            }
-            let p_i = sim_pos[i];
-            let p_j = sim_pos[j];
-            let mut d = p_j - p_i;
-            let dist2 = d.length_squared();
-            if dist2 > thickness_sq || dist2 < 1e-18 {
-                continue;
-            }
-            let r0 = rest_pos[i];
-            let r1 = rest_pos[j];
-            let rest_d = r1 - r0;
-            let rest2 = rest_d.length_squared();
-            if dist2 > rest2 {
-                continue;
-            }
-            let mut min_d = thickness;
-            if rest2 < thickness_sq {
-                min_d = rest2.sqrt();
-            }
-            let dist = dist2.sqrt();
-            let corr = (min_d - dist) * 0.5 * coll_scale;
-            if corr <= 0.0 {
-                continue;
-            }
-            d = (d / dist) * corr;
             let w_i = inv_mass[i];
             let w_j = inv_mass[j];
-            let inv_w = 1.0 / (w_i + w_j).max(1e-8);
-            let di = -d * w_i * inv_w;
-            let dj = d * w_j * inv_w;
+            let (hit, di, dj) = self_collision_separation(
+                thickness,
+                coll_scale,
+                sim_pos[i],
+                sim_pos[j],
+                rest_pos[i],
+                rest_pos[j],
+                w_i,
+                w_j,
+            );
+            if !hit {
+                continue;
+            }
             if w_i > 0.0 {
                 accum[i] += di;
             }
@@ -147,13 +225,14 @@ fn jacobi_edges_pass(
     lambda: &mut [f32],
     delta_lambda: &mut [f32],
     inv_dt_sq: f32,
+    p: &XpbdCpuTimeStepParams,
 ) {
     let e_count = constraint_i.len();
     for e in 0..e_count {
         let i = constraint_i[e] as usize;
         let j = constraint_j[e] as usize;
-        let w_i = inv_mass[i];
-        let w_j = inv_mass[j];
+        let w_i = effective_inv_mass(i, inv_mass[i], p);
+        let w_j = effective_inv_mass(j, inv_mass[j], p);
         if w_j <= 0.0 && w_i <= 0.0 {
             delta_lambda[e] = 0.0;
             continue;
@@ -169,15 +248,8 @@ fn jacobi_edges_pass(
             continue;
         }
         gv /= len;
-        let c = len - rest;
-        let alpha_t = compliance * inv_dt_sq;
-        let wsum = w_i + w_j + alpha_t;
-        if wsum < 1e-8 {
-            delta_lambda[e] = 0.0;
-            continue;
-        }
         let lam = lambda[e];
-        let dlam = (-c - alpha_t * lam) / wsum;
+        let dlam = xpbd_distance_delta_lambda(len, rest, w_i, w_j, compliance, inv_dt_sq, lam);
         delta_lambda[e] = dlam;
         lambda[e] = lam + dlam;
     }
@@ -193,8 +265,9 @@ fn jacobi_gather_particle(
     neighbor_constraint_id: &[u32],
     delta_lambda: &[f32],
     jacobi_omega: f32,
+    p: &XpbdCpuTimeStepParams,
 ) -> Vec3 {
-    let w_i = inv_mass[i];
+    let w_i = effective_inv_mass(i, inv_mass[i], p);
     if w_i <= 0.0 {
         return jac_in[i];
     }
@@ -205,7 +278,7 @@ fn jacobi_gather_particle(
 
     for k in start..end {
         let j = neighbor_other[k] as usize;
-        let w_j = inv_mass[j];
+        let w_j = effective_inv_mass(j, inv_mass[j], p);
         if w_j <= 0.0 && w_i <= 0.0 {
             continue;
         }
@@ -283,6 +356,7 @@ fn xpbd_substep_integrate(
             &mut lambda,
             &mut delta_lambda,
             inv_dt_sq,
+            p,
         );
 
         for i in 0..n {
@@ -295,6 +369,7 @@ fn xpbd_substep_integrate(
                 neighbor_constraint_id,
                 &delta_lambda,
                 p.jacobi_omega,
+                p,
             );
         }
     }
@@ -349,8 +424,8 @@ fn xpbd_substep_integrate(
         for e in 0..num_constraints {
             let i = constraint_i[e] as usize;
             let j = constraint_j[e] as usize;
-            let w_i = inv_mass[i];
-            let w_j = inv_mass[j];
+            let w_i = effective_inv_mass(i, inv_mass[i], p);
+            let w_j = effective_inv_mass(j, inv_mass[j], p);
             if w_j <= 0.0 && w_i <= 0.0 {
                 continue;
             }
@@ -364,14 +439,8 @@ fn xpbd_substep_integrate(
                 continue;
             }
             gv /= len;
-            let c = len - rest;
-            let alpha_t = compliance * inv_dt_sq;
-            let wsum = w_i + w_j + alpha_t;
-            if wsum < 1e-8 {
-                continue;
-            }
             let lam = lambda[e];
-            let dlam = (-c - alpha_t * lam) / wsum;
+            let dlam = xpbd_distance_delta_lambda(len, rest, w_i, w_j, compliance, inv_dt_sq, lam);
             lambda[e] = lam + dlam;
 
             let dx_i = clamp_correction(omega * gv * w_i * dlam);
@@ -748,6 +817,293 @@ mod tests {
         }
     }
 
+    /// Stiff two-particle distance edge (rest length 1); particle 0 pinned.
+    fn two_particle_params() -> XpbdCpuTimeStepParams {
+        let sdt = REFERENCE_FRAME_DELTA_SECS / SUBSTEPS as f32;
+        XpbdCpuTimeStepParams {
+            dt: sdt,
+            inv_dt: 1.0 / sdt,
+            jacobi_omega: 1.0,
+            inner_iterations: 16,
+            gravity: Vec3::ZERO,
+            grab_idx: -1,
+            grab_active: false,
+            grab_target: Vec3::ZERO,
+            grab_stiffness: 0.0,
+            linear_drag_per_sec: 0.0,
+        }
+    }
+
+    fn edge_length(sim: &[Vec3]) -> f32 {
+        (sim[1] - sim[0]).length()
+    }
+
+    #[cfg(feature = "solver-jacobi")]
+    fn run_two_particle_jacobi(sim: &mut [Vec3], frames: u32) {
+        let inv_mass = [0.0_f32, 1.0];
+        let constraint_i = [0u32];
+        let constraint_j = [1u32];
+        let constraint_rest = [1.0_f32];
+        let constraint_comp = [0.0_f32];
+        // Particle-centric neighbors for the single undirected edge.
+        let neighbor_offsets = [0u32, 1, 2];
+        let neighbor_other = [1u32, 0];
+        let neighbor_constraint_id = [0u32, 0];
+        let n = 2;
+        let mut prev = vec![Vec3::ZERO; n];
+        let mut vel = vec![Vec3::ZERO; n];
+        let mut jac_a = vec![Vec3::ZERO; n];
+        let mut jac_b = vec![Vec3::ZERO; n];
+        let p = two_particle_params();
+        for _ in 0..frames {
+            xpbd_frame_no_collision(
+                sim,
+                &mut prev,
+                &mut vel,
+                &mut jac_a,
+                &mut jac_b,
+                &inv_mass,
+                &neighbor_offsets,
+                &neighbor_other,
+                &neighbor_constraint_id,
+                &constraint_i,
+                &constraint_j,
+                &constraint_rest,
+                &constraint_comp,
+                &p,
+            );
+        }
+    }
+
+    #[cfg(feature = "solver-gauss-seidel")]
+    fn run_two_particle_gs(sim: &mut [Vec3], frames: u32) {
+        let inv_mass = [0.0_f32, 1.0];
+        let constraint_i = [0u32];
+        let constraint_j = [1u32];
+        let constraint_rest = [1.0_f32];
+        let constraint_comp = [0.0_f32];
+        let n = 2;
+        let mut prev = vec![Vec3::ZERO; n];
+        let mut vel = vec![Vec3::ZERO; n];
+        let mut jac = vec![Vec3::ZERO; n];
+        let p = two_particle_params();
+        for _ in 0..frames {
+            xpbd_frame_no_collision(
+                sim,
+                &mut prev,
+                &mut vel,
+                &mut jac,
+                &inv_mass,
+                &constraint_i,
+                &constraint_j,
+                &constraint_rest,
+                &constraint_comp,
+                &p,
+            );
+        }
+    }
+
+    #[test]
+    fn xpbd_two_particle_stretch_converges_toward_rest_length() {
+        let mut sim = [Vec3::ZERO, Vec3::new(2.0, 0.0, 0.0)];
+        let err0 = (edge_length(&sim) - 1.0).abs();
+        #[cfg(feature = "solver-jacobi")]
+        run_two_particle_jacobi(&mut sim, 4);
+        #[cfg(feature = "solver-gauss-seidel")]
+        run_two_particle_gs(&mut sim, 4);
+        let err1 = (edge_length(&sim) - 1.0).abs();
+        assert!(sim.iter().all(|p| p.is_finite()));
+        assert!(
+            err1 < err0 * 0.25,
+            "stretch error should drop sharply: {err0} -> {err1} (len={})",
+            edge_length(&sim)
+        );
+        assert!(
+            (sim[0] - Vec3::ZERO).length() < 1e-5,
+            "pinned particle moved"
+        );
+    }
+
+    #[test]
+    fn xpbd_two_particle_compression_converges_toward_rest_length() {
+        let mut sim = [Vec3::ZERO, Vec3::new(0.25, 0.0, 0.0)];
+        let err0 = (edge_length(&sim) - 1.0).abs();
+        #[cfg(feature = "solver-jacobi")]
+        run_two_particle_jacobi(&mut sim, 4);
+        #[cfg(feature = "solver-gauss-seidel")]
+        run_two_particle_gs(&mut sim, 4);
+        let err1 = (edge_length(&sim) - 1.0).abs();
+        assert!(err1 < err0 * 0.25, "compression error {err0} -> {err1}");
+        assert!((edge_length(&sim) - 1.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn xpbd_two_particle_at_rest_stays_at_rest_without_gravity() {
+        let mut sim = [Vec3::ZERO, Vec3::new(1.0, 0.0, 0.0)];
+        #[cfg(feature = "solver-jacobi")]
+        run_two_particle_jacobi(&mut sim, 2);
+        #[cfg(feature = "solver-gauss-seidel")]
+        run_two_particle_gs(&mut sim, 2);
+        assert!((edge_length(&sim) - 1.0).abs() < 1e-4);
+        assert!((sim[0] - Vec3::ZERO).length() < 1e-5);
+        assert!((sim[1] - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-3);
+    }
+
+    #[test]
+    fn xpbd_predict_applies_gravity_then_drag_damps_velocity() {
+        let dt = 1.0 / 60.0;
+        let mut sim = [Vec3::ZERO];
+        let mut prev = [Vec3::ZERO];
+        let mut vel = [Vec3::ZERO];
+        let inv_mass = [1.0_f32];
+        let p = XpbdCpuTimeStepParams {
+            dt,
+            inv_dt: 1.0 / dt,
+            jacobi_omega: 0.0,
+            inner_iterations: 0,
+            gravity: Vec3::new(0.0, -10.0, 0.0),
+            grab_idx: -1,
+            grab_active: false,
+            grab_target: Vec3::ZERO,
+            grab_stiffness: 0.0,
+            linear_drag_per_sec: 0.0,
+        };
+        // Predict + empty constraint solve via post_velocity path: use integrate helpers
+        // through a zero-constraint substep.
+        #[cfg(feature = "solver-jacobi")]
+        {
+            let mut jac_a = [Vec3::ZERO];
+            let mut jac_b = [Vec3::ZERO];
+            let neighbor_offsets = [0u32, 0];
+            xpbd_substep_no_collision(
+                &mut sim,
+                &mut prev,
+                &mut vel,
+                &mut jac_a,
+                &mut jac_b,
+                &inv_mass,
+                &neighbor_offsets,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &p,
+            );
+        }
+        #[cfg(feature = "solver-gauss-seidel")]
+        {
+            let mut jac = [Vec3::ZERO];
+            xpbd_substep_no_collision(
+                &mut sim,
+                &mut prev,
+                &mut vel,
+                &mut jac,
+                &inv_mass,
+                &[],
+                &[],
+                &[],
+                &[],
+                &p,
+            );
+        }
+        assert!(
+            vel[0].y < -0.1,
+            "gravity should accelerate downward, vel={:?}",
+            vel[0]
+        );
+        assert!(
+            sim[0].y < 0.0,
+            "particle should move down, pos={:?}",
+            sim[0]
+        );
+
+        let speed_before_drag = vel[0].length();
+        let mut p_drag = p.clone();
+        p_drag.gravity = Vec3::ZERO;
+        p_drag.linear_drag_per_sec = 20.0;
+        #[cfg(feature = "solver-jacobi")]
+        {
+            let mut jac_a = [Vec3::ZERO];
+            let mut jac_b = [Vec3::ZERO];
+            let neighbor_offsets = [0u32, 0];
+            xpbd_substep_no_collision(
+                &mut sim,
+                &mut prev,
+                &mut vel,
+                &mut jac_a,
+                &mut jac_b,
+                &inv_mass,
+                &neighbor_offsets,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &p_drag,
+            );
+        }
+        #[cfg(feature = "solver-gauss-seidel")]
+        {
+            let mut jac = [Vec3::ZERO];
+            xpbd_substep_no_collision(
+                &mut sim,
+                &mut prev,
+                &mut vel,
+                &mut jac,
+                &inv_mass,
+                &[],
+                &[],
+                &[],
+                &[],
+                &p_drag,
+            );
+        }
+        assert!(
+            vel[0].length() < speed_before_drag,
+            "drag should reduce speed: {} -> {}",
+            speed_before_drag,
+            vel[0].length()
+        );
+    }
+
+    #[cfg(feature = "solver-jacobi")]
+    #[test]
+    fn xpbd_jacobi_delta_lambda_matches_macklin_formula() {
+        // Isolated check of Eq. 17–18 style Δλ for one stretched edge (α̃ = 0).
+        let jac_in = [Vec3::ZERO, Vec3::new(2.0, 0.0, 0.0)];
+        let inv_mass = [1.0_f32, 1.0];
+        let constraint_i = [0u32];
+        let constraint_j = [1u32];
+        let constraint_rest = [1.0_f32];
+        let constraint_comp = [0.0_f32];
+        let mut lambda = [0.0_f32];
+        let mut delta_lambda = [0.0_f32];
+        let inv_dt_sq = 1.0_f32;
+        let p = two_particle_params();
+        jacobi_edges_pass(
+            &jac_in,
+            &inv_mass,
+            &constraint_i,
+            &constraint_j,
+            &constraint_rest,
+            &constraint_comp,
+            &mut lambda,
+            &mut delta_lambda,
+            inv_dt_sq,
+            &p,
+        );
+        // C = len - rest = 1, wsum = 2, Δλ = -C / wsum = -0.5
+        assert!(
+            (delta_lambda[0] - (-0.5)).abs() < 1e-5,
+            "Δλ={}",
+            delta_lambda[0]
+        );
+        assert!((lambda[0] - (-0.5)).abs() < 1e-5);
+    }
+
     #[test]
     fn cloth_mesh_inv_mass_and_neighbors_sane() {
         let cloth = cloth_test_grid();
@@ -1047,7 +1403,7 @@ f 1/1 2/2 3/3
     }
 
     #[test]
-    fn cpu_self_collision_skips_when_world_separation_exceeds_rest() {
+    fn cpu_self_collision_skips_outside_thickness() {
         let thickness = 0.04_f32;
         let coll_scale = 0.38_f32;
         let inv_mass = vec![1.0_f32, 1.0];
@@ -1057,6 +1413,30 @@ f 1/1 2/2 3/3
         self_collision_resolve(&mut sim, &inv_mass, &rest_pos, thickness, coll_scale);
         assert_eq!(sim[0], before[0]);
         assert_eq!(sim[1], before[1]);
+    }
+
+    #[test]
+    fn cpu_self_collision_local_skips_when_not_compressed_below_rest() {
+        // Local edge (rest < 1.35×thickness): do not inflate when world len ≥ rest.
+        let thickness = 0.04_f32;
+        let coll_scale = 1.0_f32;
+        let inv_mass = vec![1.0_f32, 1.0];
+        let rest_pos = vec![Vec3::ZERO, Vec3::new(0.02, 0.0, 0.0)];
+        let mut sim = vec![Vec3::ZERO, Vec3::new(0.025, 0.0, 0.0)];
+        let before = sim.clone();
+        self_collision_resolve(&mut sim, &inv_mass, &rest_pos, thickness, coll_scale);
+        assert_eq!(sim[0], before[0]);
+        assert_eq!(sim[1], before[1]);
+    }
+
+    #[test]
+    fn cpu_edge_compress_floor_expands_heavily_compressed_edge() {
+        let inv_mass = [1.0_f32, 1.0];
+        let rest = 1.0_f32;
+        let len = 0.5_f32; // below 0.70 floor
+        let dlam = xpbd_distance_delta_lambda(len, rest, inv_mass[0], inv_mass[1], 1.0, 1.0, 0.0);
+        // Hard expand toward 0.70: C = 0.5 - 0.70 = -0.20 → Δλ = 0.10
+        assert!((dlam - 0.10).abs() < 1e-5, "Δλ={dlam}");
     }
 
     #[test]

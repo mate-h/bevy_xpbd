@@ -22,38 +22,41 @@
 //! **Note:** See **`docs/CLOTH_SIM_STABILITY.md`** for stability history.
 
 use bevy::{
-    asset::{embedded_asset, RenderAssetUsages},
+    asset::RenderAssetUsages,
     core_pipeline::schedule::camera_driver,
     prelude::*,
     reflect::Reflect,
     render::{
         extract_resource::{ExtractResource, ExtractResourcePlugin},
         render_asset::RenderAssets,
-        render_resource::{
-            binding_types::{
-                storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer_sized,
-            },
-            ShaderType, *,
-        },
+        render_resource::{ShaderType, *},
         renderer::{RenderContext, RenderDevice, RenderGraph, RenderQueue},
         storage::{GpuShaderBuffer, ShaderBuffer},
         Render, RenderApp, RenderSystems,
     },
+    shader::Shader,
+};
+#[cfg(feature = "solver-gauss-seidel")]
+use bevy::{
+    render::render_resource::binding_types::{
+        storage_buffer_read_only_sized, storage_buffer_sized, uniform_buffer_sized,
+    },
     shader::ShaderCacheError,
 };
 use std::borrow::Cow;
+#[cfg(feature = "solver-gauss-seidel")]
 use std::num::NonZero;
 #[cfg(feature = "solver-gauss-seidel")]
 use std::ops::Deref;
 
 use crate::mesh_prep::ClothMeshData;
 
-#[cfg(feature = "solver-gauss-seidel")]
-pub const CLOTH_SHADER: &str = "embedded://bevy_softbody/shaders/cloth_sim.wgsl";
-#[cfg(feature = "solver-jacobi")]
-pub const CLOTH_SHADER: &str = "embedded://bevy_softbody/shaders/cloth_sim_jacobi.wgsl";
-#[cfg(feature = "solver-jacobi")]
-pub const CLOTH_SHADER_JACOBI: &str = "embedded://bevy_softbody/shaders/cloth_sim_jacobi.wgsl";
+/// Compiled rust-gpu SPIR-V (`crates/softbody_solver`, via `build.rs` / spirv-builder).
+pub const SOFTBODY_SOLVER_SPV: &[u8] = include_bytes!(env!("softbody_solver.spv"));
+
+/// Main-world handle to the cloth compute SPIR-V module (extracted into the render world).
+#[derive(Resource, ExtractResource, Clone)]
+pub struct ClothComputeShader(pub Handle<Shader>);
 /// XPBD (Müller et al.): use enough substeps so constraint corrections stay well-behaved vs. `dt`.
 /// More substeps shrink substep `dt` → XPBD `α̃ = α/dt²` stays moderate and implicit integration is stabler.
 pub const SUBSTEPS: u32 = 36;
@@ -83,8 +86,9 @@ pub const JACOBI_CORRECTION_CAP: f32 = 0.28;
 /// Hard speed clamp after gravity in `predict` (m/s).
 pub const PREDICT_MAX_SPEED: f32 = 12.0;
 /// Max world-space pull toward `grab_target` per particle per substep (predict pass).
-pub const GRAB_MAX_PULL_PER_SUBSTEP: f32 = 0.065;
-/// Integer scale for GPU `atomicAdd` in self-collision narrow phase (`cloth_sim.wgsl`); CPU sums `f32` directly.
+/// Kept near one fine-grid cell so corner grabs cannot inject multi-cell jumps each substep.
+pub const GRAB_MAX_PULL_PER_SUBSTEP: f32 = 0.028;
+/// Integer scale for GPU `atomicAdd` in self-collision narrow phase; CPU sums `f32` directly.
 pub const COLLISION_PAIR_FIXSCALE: i32 = 10_000;
 /// Clamp on accumulated self-collision displacement per particle per substep (`collide_apply`).
 pub const COLLISION_APPLY_CLAMP: f32 = 0.35;
@@ -242,7 +246,7 @@ impl Default for ClothSimUniforms {
     }
 }
 
-/// WGSL `SimParams`. Must match WGSL packing in `cloth_sim.wgsl`; written with [`bytemuck`] (not encase).
+/// GPU `SimParams` uniform. Must match `crates/softbody_solver` / historical WGSL packing; written with [`bytemuck`] (not encase).
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ClothSimParamsGpu {
@@ -272,9 +276,9 @@ pub struct ClothSimParamsGpu {
     pub _uniform_encase_reserve: [u32; 2],
 }
 
-/// **`coll_grid_u`** uniform (`cloth_sim.wgsl`) — spatial hash bookkeeping for **`collide_grid_cells`**.
+/// **`coll_grid_u`** uniform — spatial hash bookkeeping for **`collide_grid_cells`**.
 ///
-/// WGSL aligns the trailing **`vec4<u32>`_reserved** — keep **`_align_pad`** + **`_reserved`** in sync with `cloth_sim.wgsl`.
+/// Trailing **`vec4<u32>` `_reserved`** alignment — keep **`_align_pad`** + **`_reserved`** in sync with `crates/softbody_solver`.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ClothCollGridGpu {
@@ -444,13 +448,9 @@ pub struct ClothComputePlugin;
 
 impl Plugin for ClothComputePlugin {
     fn build(&self, app: &mut App) {
-        #[cfg(feature = "solver-gauss-seidel")]
-        embedded_asset!(app, "shaders/cloth_sim.wgsl");
-        #[cfg(feature = "solver-jacobi")]
-        embedded_asset!(app, "shaders/cloth_sim_jacobi.wgsl");
-
         app.init_resource::<ClothSimControl>();
         app.init_resource::<ClothSimFrameTiming>();
+        app.add_systems(Startup, load_cloth_compute_shader);
         app.add_systems(
             PreUpdate,
             sync_cloth_solve_budget_to_uniforms.run_if(resource_exists::<ClothSimConfig>),
@@ -459,6 +459,7 @@ impl Plugin for ClothComputePlugin {
             ExtractResourcePlugin::<ClothSimConfig>::default(),
             ExtractResourcePlugin::<ClothSimUniforms>::default(),
             ExtractResourcePlugin::<ClothSimControl>::default(),
+            ExtractResourcePlugin::<ClothComputeShader>::default(),
         ));
 
         let render_app = app.sub_app_mut(RenderApp);
@@ -476,6 +477,14 @@ impl Plugin for ClothComputePlugin {
             )
             .add_systems(RenderGraph, run_cloth_sim.before(camera_driver));
     }
+}
+
+fn load_cloth_compute_shader(mut commands: Commands, mut shaders: ResMut<Assets<Shader>>) {
+    let handle = shaders.add(Shader::from_spirv(
+        Cow::Borrowed(SOFTBODY_SOLVER_SPV),
+        "embedded://bevy_softbody/softbody_solver.spv",
+    ));
+    commands.insert_resource(ClothComputeShader(handle));
 }
 
 /// Restores GPU sim buffers to the mesh rest pose (positions, zero velocity, cleared λ).
@@ -574,7 +583,7 @@ fn init_cloth_sim(
     uniforms: Res<ClothSimUniforms>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
-    asset_server: Res<AssetServer>,
+    compute_shader: Option<Res<ClothComputeShader>>,
     pipeline_cache: Res<PipelineCache>,
     #[cfg(feature = "solver-gauss-seidel")] existing: Option<Res<ClothSimBuffers>>,
     #[cfg(feature = "solver-jacobi")] existing_j: Option<
@@ -595,6 +604,9 @@ fn init_cloth_sim(
     if config.num_particles == 0 {
         return;
     }
+    let Some(compute_shader) = compute_shader else {
+        return;
+    };
 
     #[cfg(feature = "solver-jacobi")]
     {
@@ -604,7 +616,7 @@ fn init_cloth_sim(
             uniforms.as_ref(),
             &render_device,
             &render_queue,
-            &asset_server,
+            &compute_shader.0,
             &pipeline_cache,
         );
         return;
@@ -617,7 +629,7 @@ fn init_cloth_sim(
         uniforms.as_ref(),
         &render_device,
         &render_queue,
-        &asset_server,
+        &compute_shader.0,
         &pipeline_cache,
     );
 }
@@ -629,7 +641,7 @@ fn init_cloth_sim_gauss_seidel(
     uniforms: &ClothSimUniforms,
     render_device: &RenderDevice,
     render_queue: &RenderQueue,
-    asset_server: &AssetServer,
+    shader: &Handle<Shader>,
     pipeline_cache: &PipelineCache,
 ) {
     let n = config.num_particles as usize;
@@ -935,7 +947,7 @@ fn init_cloth_sim_gauss_seidel(
         ),
     );
 
-    let shader = asset_server.load(CLOTH_SHADER);
+    let shader = shader.clone();
 
     macro_rules! cp {
         ($label:literal, $name:literal) => {
@@ -953,40 +965,46 @@ fn init_cloth_sim_gauss_seidel(
         layout: layout.clone(),
         predict_copy_sim_to_jac: cp!(
             "cloth_cs_predict_copy_sim_to_jac",
-            "predict_copy_sim_to_jac"
+            "gs::predict_copy_sim_to_jac"
         ),
-        copy_jac_to_sim: cp!("cloth_cs_copy_jac_to_sim", "copy_jac_to_sim"),
+        copy_jac_to_sim: cp!("cloth_cs_copy_jac_to_sim", "gs::copy_jac_to_sim"),
         clear_constraint_lambda: cp!(
             "cloth_cs_clear_constraint_lambda",
-            "clear_constraint_lambda"
+            "gs::clear_constraint_lambda"
         ),
-        gs_edges: cp!("cloth_cs_gs_edges", "gs_edges"),
-        post_velocity: cp!("cloth_cs_post_velocity", "post_velocity"),
-        clear_atomics: cp!("cloth_cs_clear_atomics", "clear_atomics"),
-        coll_cell_bounds_clear: cp!("cloth_cs_coll_cell_bounds_clear", "coll_cell_bounds_clear"),
+        gs_edges: cp!("cloth_cs_gs_edges", "gs::gs_edges"),
+        post_velocity: cp!("cloth_cs_post_velocity", "gs::post_velocity"),
+        clear_atomics: cp!("cloth_cs_clear_atomics", "gs::clear_atomics"),
+        coll_cell_bounds_clear: cp!(
+            "cloth_cs_coll_cell_bounds_clear",
+            "gs::coll_cell_bounds_clear"
+        ),
         coll_perm_identity_ping: cp!(
             "cloth_cs_coll_perm_identity_ping",
-            "coll_perm_identity_ping"
+            "gs::coll_perm_identity_ping"
         ),
-        coll_histogram_clear: cp!("cloth_cs_coll_histogram_clear", "coll_histogram_clear"),
-        coll_radix_digit_count: cp!("cloth_cs_coll_radix_digit_count", "coll_radix_digit_count"),
+        coll_histogram_clear: cp!("cloth_cs_coll_histogram_clear", "gs::coll_histogram_clear"),
+        coll_radix_digit_count: cp!(
+            "cloth_cs_coll_radix_digit_count",
+            "gs::coll_radix_digit_count"
+        ),
         coll_radix_exclusive_bases_heads: cp!(
             "cloth_cs_coll_radix_exclusive_bases_heads",
-            "coll_radix_exclusive_bases_heads"
+            "gs::coll_radix_exclusive_bases_heads"
         ),
         coll_radix_digit_scatter: cp!(
             "cloth_cs_coll_radix_digit_scatter",
-            "coll_radix_digit_scatter"
+            "gs::coll_radix_digit_scatter"
         ),
         coll_sorted_build_cell_ranges: cp!(
             "cloth_cs_coll_sorted_build_cell_ranges",
-            "coll_sorted_build_cell_ranges"
+            "gs::coll_sorted_build_cell_ranges"
         ),
-        collide_grid_cells: cp!("cloth_cs_collide_grid_cells", "collide_grid_cells"),
-        collide_apply: cp!("cloth_cs_collide_apply", "collide_apply"),
-        clear_norm_atomics: cp!("cloth_cs_clear_norm_atomics", "clear_norm_atomics"),
-        accumulate_normals: cp!("cloth_cs_accumulate_normals", "accumulate_normals"),
-        finalize_normals: cp!("cloth_cs_finalize_normals", "finalize_normals"),
+        collide_grid_cells: cp!("cloth_cs_collide_grid_cells", "gs::collide_grid_cells"),
+        collide_apply: cp!("cloth_cs_collide_apply", "gs::collide_apply"),
+        clear_norm_atomics: cp!("cloth_cs_clear_norm_atomics", "gs::clear_norm_atomics"),
+        accumulate_normals: cp!("cloth_cs_accumulate_normals", "gs::accumulate_normals"),
+        finalize_normals: cp!("cloth_cs_finalize_normals", "gs::finalize_normals"),
     });
 
     commands.insert_resource(ClothSimBuffers {

@@ -19,7 +19,7 @@ use std::num::NonZero;
 
 use crate::cloth_compute::{
     ClothCollGridGpu, ClothCollRadixPassGpu, ClothLoadState, ClothSimConfig, ClothSimControl,
-    ClothSimParamsGpu, ClothSimUniforms, CLOTH_SHADER_JACOBI,
+    ClothSimParamsGpu, ClothSimUniforms,
 };
 use crate::mesh_prep::ClothMeshData;
 
@@ -216,7 +216,7 @@ pub fn init_cloth_sim_jacobi(
     uniforms: &ClothSimUniforms,
     render_device: &RenderDevice,
     render_queue: &RenderQueue,
-    asset_server: &AssetServer,
+    shader: &Handle<bevy::shader::Shader>,
     pipeline_cache: &PipelineCache,
 ) {
     let n = config.num_particles as usize;
@@ -482,7 +482,7 @@ pub fn init_cloth_sim_jacobi(
     render_queue.write_buffer(&vel, 0, &vec![0u8; vec4_sz(n) as usize]);
 
     let layout = jacobi_bind_layout(radix_nz, perm_nz, cell_nz);
-    let shader = asset_server.load(CLOTH_SHADER_JACOBI);
+    let shader = shader.clone();
 
     macro_rules! cp {
         ($label:literal, $name:literal) => {
@@ -500,41 +500,50 @@ pub fn init_cloth_sim_jacobi(
         layout: layout.clone(),
         predict_copy_sim_to_jac: cp!(
             "cloth_cs_predict_copy_sim_to_jac",
-            "predict_copy_sim_to_jac"
+            "jacobi::predict_copy_sim_to_jac"
         ),
-        copy_jac_to_sim: cp!("cloth_cs_copy_jac_to_sim", "copy_jac_to_sim"),
+        copy_jac_to_sim: cp!("cloth_cs_copy_jac_to_sim", "jacobi::copy_jac_to_sim"),
         clear_constraint_lambda: cp!(
             "cloth_cs_clear_constraint_lambda",
-            "clear_constraint_lambda"
+            "jacobi::clear_constraint_lambda"
         ),
-        jacobi_edges: cp!("cloth_cs_jacobi_edges", "jacobi_edges"),
-        jacobi_gather: cp!("cloth_cs_jacobi_gather", "jacobi_gather"),
-        post_velocity: cp!("cloth_cs_post_velocity", "post_velocity"),
-        clear_atomics: cp!("cloth_cs_clear_atomics", "clear_atomics"),
-        coll_cell_bounds_clear: cp!("cloth_cs_coll_cell_bounds_clear", "coll_cell_bounds_clear"),
+        jacobi_edges: cp!("cloth_cs_jacobi_edges", "jacobi::jacobi_edges"),
+        jacobi_gather: cp!("cloth_cs_jacobi_gather", "jacobi::jacobi_gather"),
+        post_velocity: cp!("cloth_cs_post_velocity", "jacobi::post_velocity"),
+        clear_atomics: cp!("cloth_cs_clear_atomics", "jacobi::clear_atomics"),
+        coll_cell_bounds_clear: cp!(
+            "cloth_cs_coll_cell_bounds_clear",
+            "jacobi::coll_cell_bounds_clear"
+        ),
         coll_perm_identity_ping: cp!(
             "cloth_cs_coll_perm_identity_ping",
-            "coll_perm_identity_ping"
+            "jacobi::coll_perm_identity_ping"
         ),
-        coll_histogram_clear: cp!("cloth_cs_coll_histogram_clear", "coll_histogram_clear"),
-        coll_radix_digit_count: cp!("cloth_cs_coll_radix_digit_count", "coll_radix_digit_count"),
+        coll_histogram_clear: cp!(
+            "cloth_cs_coll_histogram_clear",
+            "jacobi::coll_histogram_clear"
+        ),
+        coll_radix_digit_count: cp!(
+            "cloth_cs_coll_radix_digit_count",
+            "jacobi::coll_radix_digit_count"
+        ),
         coll_radix_exclusive_bases_heads: cp!(
             "cloth_cs_coll_radix_exclusive_bases_heads",
-            "coll_radix_exclusive_bases_heads"
+            "jacobi::coll_radix_exclusive_bases_heads"
         ),
         coll_radix_digit_scatter: cp!(
             "cloth_cs_coll_radix_digit_scatter",
-            "coll_radix_digit_scatter"
+            "jacobi::coll_radix_digit_scatter"
         ),
         coll_sorted_build_cell_ranges: cp!(
             "cloth_cs_coll_sorted_build_cell_ranges",
-            "coll_sorted_build_cell_ranges"
+            "jacobi::coll_sorted_build_cell_ranges"
         ),
-        collide_grid_cells: cp!("cloth_cs_collide_grid_cells", "collide_grid_cells"),
-        collide_apply: cp!("cloth_cs_collide_apply", "collide_apply"),
-        clear_norm_atomics: cp!("cloth_cs_clear_norm_atomics", "clear_norm_atomics"),
-        accumulate_normals: cp!("cloth_cs_accumulate_normals", "accumulate_normals"),
-        finalize_normals: cp!("cloth_cs_finalize_normals", "finalize_normals"),
+        collide_grid_cells: cp!("cloth_cs_collide_grid_cells", "jacobi::collide_grid_cells"),
+        collide_apply: cp!("cloth_cs_collide_apply", "jacobi::collide_apply"),
+        clear_norm_atomics: cp!("cloth_cs_clear_norm_atomics", "jacobi::clear_norm_atomics"),
+        accumulate_normals: cp!("cloth_cs_accumulate_normals", "jacobi::accumulate_normals"),
+        finalize_normals: cp!("cloth_cs_finalize_normals", "jacobi::finalize_normals"),
     });
 
     commands.insert_resource(ClothSimBuffersJacobi {

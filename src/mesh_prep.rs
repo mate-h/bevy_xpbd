@@ -11,7 +11,7 @@ pub const COLLISION_GRID_MAX_CELLS: u32 = 32_768;
 /// Maximum grid resolution along one axis (`derive_collision_grid` grows cell size to stay under [`COLLISION_GRID_MAX_CELLS`]).
 pub const COLLISION_GRID_MAX_AXIS: u32 = 96;
 
-/// BBox (`origin` = min corner) and cell quantization for **`collide_grid_cells`** (`cloth_sim.wgsl`).
+/// BBox (`origin` = min corner) and cell quantization for **`collide_grid_cells`**.
 /// Returns `(origin, inv_cell_size, dims[gxyz], num_cells, radix_digits)` for sorting keys in `[0, num_cells)`.
 pub fn derive_collision_grid(
     rest_positions: &[Vec4],

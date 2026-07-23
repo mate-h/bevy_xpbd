@@ -15,8 +15,6 @@ XPBD uses a Lagrange multiplier λ per constraint (see Macklin et al., Eq. 17–
 - GPU (Jacobi, default): **`clear_constraint_lambda`** → **`jacobi_edges`** → **`jacobi_gather`** per inner iter in **`cloth_pass_distance_jacobi`** (`src/cloth_jacobi.rs`).
 - GPU (GS feature): **`clear_constraint_lambda`** then **`gs_edges`** once per batch; **all inner iterations of a substep** share **one** `cloth_pass_distance_gauss_seidel` compute pass. GS batches use **`binding(19)`** dynamic-uniform **`set_bind_group` offsets**.
 - CPU reference (`xpbd_cpu.rs`): `lambda.fill(0.0)` at the start of each inner iteration.
-- Parity harness: `gpu_cpu_parity_jacobi.rs` (default) or `gpu_cpu_parity.rs` (GS feature).
-
 **Supporting tuning:** Stretch compliance stays near `DEFAULT_STRETCH_COMPLIANCE` (~`2e-8`) in `mesh_prep.rs`. Default **`jacobi_omega`** is **`0.32`** (Jacobi) or **`1.0`** (GS feature); **`JACOBI_CORRECTION_CAP`** clamps each endpoint delta per constraint. **`grab_stiffness`** defaults to **`0.28`** (Jacobi) / **`0.45`** (GS); predict applies at most **`GRAB_MAX_PULL_PER_SUBSTEP`** (0.065 m) per substep toward the mouse target.
 
 ## 2. Rendering: correct particle index (the visual “ball”)
@@ -32,7 +30,7 @@ Without a reliable index, the GPU draws garbage positions while compute still up
 
 ## 3. CPU neighbor slices (mesh validation only)
 
-Neighbor lists (**`neighbor_offsets`**, **`neighbor_other`**, **`neighbor_constraint_id`**) remain on `ClothMeshData` for regression tests and tooling. The default **Jacobi** build uploads **`neighbor_offsets`** + **`neighbor_packed`** for **`jacobi_gather`** (`src/shaders/cloth_sim_jacobi.wgsl`). With **`solver-gauss-seidel`**, neighbors stay CPU-only.
+Neighbor lists (**`neighbor_offsets`**, **`neighbor_other`**, **`neighbor_constraint_id`**) remain on `ClothMeshData` for regression tests and tooling. The default **Jacobi** build uploads **`neighbor_offsets`** + **`neighbor_packed`** for **`jacobi_gather`** (`crates/softbody_solver`). With **`solver-gauss-seidel`**, neighbors stay CPU-only.
 
 **Invariant:** Built with **cursor‑based scatter** in `finalize_cloth_mesh` (`mesh_prep.rs`), aligned with batch-sorted constraint order.
 
@@ -42,14 +40,14 @@ Neighbor lists (**`neighbor_offsets`**, **`neighbor_other`**, **`neighbor_constr
 
 | Feature | GPU shader | Distance solve | Default `jacobi_omega` |
 |---------|------------|----------------|------------------------|
-| `solver-jacobi` (default) | `cloth_sim_jacobi.wgsl` | **`jacobi_edges`** + **`jacobi_gather`** (ping‑pong `jac_a`/`jac_b`) | `0.32` |
-| `solver-gauss-seidel` | `cloth_sim.wgsl` | Colored **`gs_edges`** batches | `1.0` |
+| `solver-jacobi` (default) | `crates/softbody_solver` (`solver-jacobi`) | **`jacobi_edges`** + **`jacobi_gather`** (ping‑pong `jac_a`/`jac_b`) | `0.32` |
+| `solver-gauss-seidel` | `crates/softbody_solver` (`solver-gauss-seidel`) | Colored **`gs_edges`** batches | `1.0` |
 
 Build Gauss–Seidel: `cargo build --no-default-features --features solver-gauss-seidel` (do **not** enable both solver features).
 
 Both paths **clear λ before each inner iteration** (stability rule from §1). Jacobi converges more slowly per iteration but uses **3 dispatches per inner iter** vs **`1 + B`** GS batch dispatches — profile with Instruments if comparing raw GPU time vs visual quality (match appearance, not iteration count).
 
-**Mouse grab (`cloth_xpbd`):** Jacobi needs **more inner iterations** than GS for the same visual stiffness under grab stress; the example uses **20** inner iters (Jacobi) vs **8** (GS). Do not grab **pinned** vertices (`inv_mass = 0`); picking skips them. If corners still blow up, lower **`grab_stiffness`** or raise **`solve_inner_iterations`** before lowering **`jacobi_omega`** further.
+**Mouse grab:** Prefer **kinematic grab** (grabbed particle has effective `inv_mass = 0`; predict soft-follows the cursor). Constraints solve *around* the handle instead of fighting a spring yank — stable at realtime budgets (~10 substeps × 6 Jacobi iters). Do not grab **pinned** vertices; picking skips them. Cost levers: mesh resolution (`CLOTH_QUAD_*`), substeps/inner iters, and `coll_scale` (self-collision / radix is expensive).
 
 **A/B profiling:** aggregate **`cloth_pass_distance_gauss_seidel`** vs **`cloth_pass_distance_jacobi`** rows in Metal GPU interval exports ([`XCTRACE_EXPORT.md`](../XCTRACE_EXPORT.md)).
 
@@ -59,11 +57,11 @@ Both paths **clear λ before each inner iteration** (stability rule from §1). J
 |------|----------|
 | Inner‑loop λ clear + **`gs_edges`** (**`cloth_pass_distance_gauss_seidel`**) | `src/cloth_compute.rs` — `run_cloth_sim` (GS feature) |
 | Jacobi inner loop (**`cloth_pass_distance_jacobi`**) | `src/cloth_jacobi.rs` — `run_cloth_sim_jacobi` (`solver-jacobi` feature) |
-| Solve budget + fuse **`predict_copy_sim_to_jac`** + collision stride | `src/cloth_compute.rs` — `ClothSimConfig`, `run_cloth_sim`; `src/shaders/cloth_sim.wgsl` |
-| GS kernel | `src/shaders/cloth_sim.wgsl` — `gs_edges` |
+| Solve budget + fuse **`predict_copy_sim_to_jac`** + collision stride | `src/cloth_compute.rs` — `ClothSimConfig`, `run_cloth_sim`; `crates/softbody_solver` |
+| GS kernel | `crates/softbody_solver/src/gs.rs` — `gs_edges` |
 | Inner‑loop λ clear + GS sweep (CPU) | `src/xpbd_cpu.rs` — `xpbd_substep_integrate` |
 | Constraint coloring + offsets | `src/mesh_prep.rs` — `partition_constraints_for_gs_batches`, `constraint_batch_offsets` |
-| Parity harness | `src/gpu_cpu_parity.rs` |
+| Shared GPU/host XPBD helpers | `crates/softbody_solver` — `common`, host `cargo test` |
 | Vertex particle index | `src/shaders/cloth_vertex.wgsl` |
 | Neighbor scatter + compliance defaults | `src/mesh_prep.rs` |
 | Quad cross-diagonal (shear / zipper fix) | `src/mesh_prep.rs` — `DEFAULT_CROSS_DIAG_COMPLIANCE` |
@@ -71,16 +69,21 @@ Both paths **clear λ before each inner iteration** (stability rule from §1). J
 
 ## Free-edge buckling (bottom hem “furling”)
 
-Triangle meshes mainly constrain **adjacent** vertices. The **bottom boundary** has fewer neighbors and can enter short‑wavelength folds (curl / furl) under gravity + soft bending.
+Triangle meshes mainly constrain **adjacent** vertices. The **bottom boundary** has fewer neighbors and can enter short‑wavelength folds (curl / furl) under gravity + soft bending. Particle self-collision alone cannot stop this: local pairs skip once `dist ≥ rest`, and soft XPBD stretch still allows deep edge compression (accordion).
 
-Mitigations in `mesh_prep.rs` (compatible with λ reset + GS batches):
+Solver mitigations (in `softbody_solver` / `xpbd_cpu`, not only UI knobs):
+
+1. **Hard edge compression floor** — when an edge is shorter than `EDGE_COMPRESS_MIN_FRAC` (0.70) of rest, expand with zero compliance.
+2. **Stronger self-collision** — non-local pairs always push to a thickness shell; correction is full `(min_d − dist) × coll_scale` (no 0.5 under-relax). Local pairs still avoid inflating edges above rest.
+
+Mesh mitigations in `mesh_prep.rs` (compatible with λ reset + GS batches):
 
 1. **Pin the full top boundary** (all vertices at maximum `y`), not only corners — avoids asymmetric sag that loads the free edge harder.
 2. **Stiffer hinge bending** — lower `DEFAULT_BEND_COMPLIANCE` resists sharp curling (`3.8` in code).
 3. **Skip‑2 braces on full XY grids** (procedural + regular welded OBJ) — every **two** vertices along each row/column (`DEFAULT_SKIP2_COMPLIANCE` ~ triangle-edge scale; much softer values let the hem **shorten in X**). See `axis_aligned_grid_skip_two_distance_constraints`.
 4. **Cross-diagonal constraints on every quad** — the diagonal **not** used as a triangle edge (`DEFAULT_CROSS_DIAG_COMPLIANCE`): removes shear “zipper” / alternating **Z** on the bottom edge (see `sim_positions.csv` diagnosis below).
 
-**Gravity:** Integrated in **`predict_copy_sim_to_jac`**: `v += gravity * dt` (`cloth_sim.wgsl`). Default **`ClothSimUniforms.gravity`** ≈ **−9.81 on Y** only (scene‑scale metres).
+**Gravity:** Integrated in **`predict_copy_sim_to_jac`**: `v += gravity * dt`. Default **`ClothSimUniforms.gravity`** ≈ **−9.81 on Y** only (scene‑scale metres).
 
 **Shear “zipper” (CSV clue):** Quad → two triangles leaves **one diagonal unstretched** as an edge. Exported **`sim_positions`** after a frame often shows the bottom chain with **alternating ±Z** while **X** steps smoothly — missing **in-plane shear** stiffness, not primarily gravity. Fix: cross-diagonal constraints in `mesh_prep.rs` with **`DEFAULT_CROSS_DIAG_COMPLIANCE`** typically **stiffer** than triangle stretch (raise **`INNER_ITERS`** if one-frame CSV still shows residual ±Z).
 
@@ -89,7 +92,7 @@ Mitigations in `mesh_prep.rs` (compatible with λ reset + GS batches):
 - Increase **`SUBSTEPS`** / **`INNER_ITERS`** or lower **`jacobi_omega`** before chasing buffer bugs.
 - Confirm the vertex path sees **`VERTEX_UVS_B`** when using UV1 particle ids (material + mesh layout).
 - **Self-collision:** default strength is **`DEFAULT_COLL_SCALE` (0.38)** in `src/cloth_compute.rs`; set `ClothSimUniforms.coll_scale` to **`0`** to disable while debugging.
-- Re‑run **`cargo test`** — GPU/CPU parity and `cloth_neighbor_slices_match_constraints` guard the worst regressions.
+- Re‑run **`cargo test`** and `cd crates/softbody_solver && cargo test` — XPBD host tests and `cloth_neighbor_slices_match_constraints` guard the worst regressions.
 
 ## Example mesh sources
 

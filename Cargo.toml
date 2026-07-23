@@ -1,3 +1,8 @@
+[workspace]
+members = ["."]
+exclude = ["crates/softbody_solver"]
+resolver = "2"
+
 [package]
 name = "bevy_softbody"
 version = "0.1.0"
@@ -12,6 +17,8 @@ keywords = ["bevy", "cloth", "softbody", "xpbd", "gpu"]
 categories = ["game-development", "graphics"]
 include = [
     "src/**/*",
+    "crates/softbody_solver/**/*",
+    "build.rs",
     "LICENSE",
     "README.md",
     "Cargo.toml",
@@ -30,13 +37,22 @@ solver-gauss-seidel = []
 solver-jacobi = []
 
 [dependencies]
-bevy = "0.19.0"
+bevy = { version = "0.19.0", features = ["shader_format_spirv"] }
 bytemuck = { version = "1.22", features = ["derive"] }
+
+[build-dependencies]
+spirv-builder = "0.10.0-alpha.1"
 
 [dev-dependencies]
 bevy_egui = "0.41"
-pollster = "0.4"
-wgpu = "29.0.3"
 
 [profile.dev]
 opt-level = 1
+
+# Keep rustc_codegen_spirv (spirv-builder build-dep) fast enough to be usable.
+[profile.dev.build-override]
+opt-level = 3
+
+[profile.release.build-override]
+opt-level = 3
+codegen-units = 16

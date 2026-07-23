@@ -177,7 +177,7 @@ fn sim_params_ui(
 
             ui.separator();
             ui.heading("Collisions");
-            ui.add(egui::Slider::new(&mut uniforms.thickness, 0.005..=0.12).text("thickness"));
+            ui.add(egui::Slider::new(&mut uniforms.thickness, 0.005..=1.0).text("thickness"));
             ui.add(egui::Slider::new(&mut uniforms.coll_scale, 0.0..=1.0).text("self-collision"));
 
             ui.separator();
@@ -190,7 +190,7 @@ fn sim_params_ui(
             if ui.button("Step frame (N)").clicked() {
                 ctrl.step_serial = ctrl.step_serial.saturating_add(1);
             }
-            if ui.button("Reinit simulation").clicked() {
+            if ui.button("Reinit simulation (R)").clicked() {
                 ctrl.reinit_serial = ctrl.reinit_serial.saturating_add(1);
             }
 
@@ -203,21 +203,21 @@ fn sim_params_ui(
 }
 
 fn reset_sim_defaults(config: &mut ClothSimConfig, uniforms: &mut ClothSimUniforms) {
-    config.solve_substeps = 24;
+    config.solve_substeps = 10;
     #[cfg(feature = "solver-jacobi")]
     {
-        config.solve_inner_iterations = 20;
+        config.solve_inner_iterations = 6;
     }
     #[cfg(feature = "solver-gauss-seidel")]
     {
-        config.solve_inner_iterations = 8;
+        config.solve_inner_iterations = 4;
     }
-    config.collision_every_n_substeps = 4;
+    config.collision_every_n_substeps = 8;
     uniforms.thickness = THICKNESS;
-    uniforms.coll_scale = DEFAULT_COLL_SCALE;
+    uniforms.coll_scale = DEFAULT_COLL_SCALE * 0.35;
     uniforms.gravity.y = -9.81;
     uniforms.linear_drag_per_sec = DEFAULT_LINEAR_AIR_DRAG_PER_SEC;
-    uniforms.grab_stiffness = 0.25;
+    uniforms.grab_stiffness = 0.45;
     #[cfg(feature = "solver-jacobi")]
     {
         uniforms.jacobi_omega = jacobi_default_omega();

@@ -1,0 +1,25 @@
+[package]
+name = "softbody_solver"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "rust-gpu XPBD softbody compute shaders (Jacobi / Gauss–Seidel)"
+
+# Built via spirv-builder from the repo root, and also as a host rlib for unit tests.
+[workspace]
+
+[lib]
+crate-type = ["dylib", "rlib"]
+
+[features]
+default = ["solver-jacobi"]
+solver-jacobi = []
+solver-gauss-seidel = []
+
+[dependencies]
+spirv-std = "0.10.0-alpha.1"
+glam = { version = "=0.30.8", default-features = false, features = ["libm"] }
+libm = "0.2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("spirv"))'] }
