@@ -26,11 +26,9 @@ use cloth_ui::ClothUiPlugin;
 /// Low-pass blend for wall-clock frame Δt (`ClothSimFrameTiming::blend_alpha`).
 const FRAME_DELTA_BLEND_ALPHA: f32 = 0.05;
 
-/// Quad resolution (was 24×18 at 0.045 m cells ≈ 1.08 × 0.81 m sheet). Aspect matches 24:18.
 const CLOTH_QUAD_COLS: u32 = 128;
 const CLOTH_QUAD_ROWS: u32 = 96;
-/// Matches prior world size: `(24 × 0.045) / 128` — tweak `CLOTH_QUAD_*` freely with this formula.
-const CLOTH_CELL_SIZE: f32 = (24.0 * 0.045 * 2.0) / CLOTH_QUAD_COLS as f32;
+const CLOTH_CELL_SIZE: f32 = (24.0 * 0.1 * 2.0) / CLOTH_QUAD_COLS as f32;
 
 fn procedural_cloth() -> ClothMeshData {
     grid_cloth_hanging(CLOTH_QUAD_COLS, CLOTH_QUAD_ROWS, CLOTH_CELL_SIZE)
@@ -92,21 +90,20 @@ fn setup(
         u.num_particles = config.num_particles;
         u.num_tris = config.num_tris;
         u.thickness = THICKNESS;
-        u.coll_scale = DEFAULT_COLL_SCALE;
-        // Jacobi defaults are softer; keep example grab gentle under corner stress.
-        u.grab_stiffness = 0.25;
+        // Collision is the other big cost; keep mild + sparse for the demo.
+        u.coll_scale = DEFAULT_COLL_SCALE * 0.35;
+        // Kinematic grab: stiffness is follow rate toward the cursor (not a spring vs XPBD).
+        u.grab_stiffness = 0.45;
     }
 
     commands.insert_resource(ClothSimConfig {
-        // Higher particle count (~12k vs ~475) benefits from somewhat more solver work than the prior demo tuning.
-        solve_substeps: 24,
-        // Jacobi converges slower per iteration than colored GS — use more inner iters (library default is 22).
+        // Realtime budget: kinematic grab stays stable without huge iteration counts.
+        solve_substeps: 10,
         #[cfg(feature = "solver-jacobi")]
-        solve_inner_iterations: 20,
+        solve_inner_iterations: 6,
         #[cfg(feature = "solver-gauss-seidel")]
-        solve_inner_iterations: 8,
-        // Halves pairwise self-collision work when `coll_scale > 0` (runs on odd-indexed substeps).
-        collision_every_n_substeps: 4,
+        solve_inner_iterations: 4,
+        collision_every_n_substeps: 8,
         render_positions: config.render_positions.clone(),
         render_normals: config.render_normals.clone(),
         ..config
@@ -147,7 +144,7 @@ fn setup(
 
     commands.spawn((
         Camera3d::default(),
-        Transform::from_xyz(0.0, 0.15, 2.25).looking_at(Vec3::new(0.0, 0.1, 0.0), Vec3::Y),
+        Transform::from_xyz(0.0, 1.0, 5.0).looking_at(Vec3::new(0.0, 1.0, 0.0), Vec3::Y),
     ));
 }
 
@@ -173,6 +170,9 @@ fn cloth_sim_debug_keys(mut ctrl: ResMut<ClothSimControl>, keys: Res<ButtonInput
     }
     if keys.just_pressed(KeyCode::KeyN) {
         ctrl.step_serial = ctrl.step_serial.saturating_add(1);
+    }
+    if keys.just_pressed(KeyCode::KeyR) {
+        ctrl.reinit_serial = ctrl.reinit_serial.saturating_add(1);
     }
 }
 
@@ -227,9 +227,12 @@ fn mouse_grab(
         if let Some((idx, t_hit)) = pick_closest_vertex(lo, ld, &pick.local_rest, &pick.inv_mass) {
             grab.active = true;
             grab.particle = idx as i32;
-            grab.ray_t = t_hit;
+            // Depth of the rest particle along the view ray (plane facing the camera).
+            // Mouse motion then slides on that plane — avoids deep/near jumps that crumple corners.
+            grab.ray_t = t_hit.max(0.05);
             uniforms.grab_idx = idx as i32;
             uniforms.grab_active = 1;
+            uniforms.grab_target = (lo + ld * grab.ray_t).extend(0.0);
         }
     }
 
@@ -238,6 +241,7 @@ fn mouse_grab(
     }
 
     if grab.active {
+        // Keep a fixed camera-depth plane from press time; only slide laterally with the cursor.
         uniforms.grab_target = (lo + ld * grab.ray_t).extend(0.0);
     }
 }
